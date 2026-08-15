@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.10.3](https://github.com/home-operations/kopiur/compare/0.10.2...0.10.3) (2026-08-15)
+
+
+### Bug Fixes
+
+* **rust:** update crate cel (0.14.2 → 0.14.3) ([#387](https://github.com/home-operations/kopiur/issues/387)) ([bf9aa0c](https://github.com/home-operations/kopiur/commit/bf9aa0c90544e2acea7bed056d0e49f2635b5a6c))
+* **rust:** update crate http-body-util (0.1.4 → 0.1.5) ([#381](https://github.com/home-operations/kopiur/issues/381)) ([6354e17](https://github.com/home-operations/kopiur/commit/6354e177736bbbe1b8b482828ce5c95cb0040b3a))
+
+
+### Miscellaneous Chores
+
+* **mise:** Update tool oxfmt (0.62.0 → 0.63.0) ([#386](https://github.com/home-operations/kopiur/issues/386)) ([65db237](https://github.com/home-operations/kopiur/commit/65db2378b4c23de220a407673f71504b3a6d87a0))
+
 ## [0.10.2](https://github.com/home-operations/kopiur/compare/0.10.1...0.10.2) (2026-08-13)
 
 
