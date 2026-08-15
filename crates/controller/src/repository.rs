@@ -23,8 +23,9 @@ use kube::{Api, Resource, ResourceExt};
 
 use kopiur_api::backend::Backend;
 use kopiur_api::common::{
-    CatalogBounds, ForeignSnapshots, PhaseLabel, RepositoryKind, RepositoryRef,
+    CatalogBounds, ForeignSnapshots, PhaseLabel, RepositoryKind, RepositoryMode, RepositoryRef,
 };
+use kopiur_api::maintenance::RepositoryMaintenanceSpec;
 use kopiur_api::repository::resolve_index_blob_warn_threshold;
 use kopiur_api::{Repository, RepositoryPhase, validate};
 use kopiur_kopia::{ConnectSpec, SnapshotListEntry};
@@ -720,9 +721,7 @@ async fn ensure_repo_maintenance(
     api: &Api<Repository>,
     conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
 ) {
-    if !repo.spec.mode.allows_writes() {
-        return;
-    }
+    let maintenance = effective_maintenance_spec(repo.spec.mode, repo.spec.maintenance.as_ref());
     let cluster = repo
         .spec
         .identity_defaults
@@ -739,12 +738,29 @@ async fn ensure_repo_maintenance(
         Some(namespace),
         Some(namespace),
         name,
-        repo.spec.maintenance.as_ref(),
+        Some(&maintenance),
         cluster,
         conditions,
         repo.metadata.generation,
     )
     .await;
+}
+
+/// Read-only repositories must never retain an operator-managed Maintenance.
+/// Feed an explicit disabled spec through the normal projection path so it can
+/// delete a managed CR left behind when a writable repository becomes read-only.
+fn effective_maintenance_spec(
+    mode: RepositoryMode,
+    configured: Option<&RepositoryMaintenanceSpec>,
+) -> RepositoryMaintenanceSpec {
+    if mode.allows_writes() {
+        configured.cloned().unwrap_or_default()
+    } else {
+        RepositoryMaintenanceSpec {
+            enabled: false,
+            ..Default::default()
+        }
+    }
 }
 
 /// Drive the mover-Job bootstrap state machine: launch the Job, then on each
@@ -2274,6 +2290,24 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use kopiur_kopia::{SnapshotSource, SnapshotStats};
+
+    #[test]
+    fn read_only_repository_forces_managed_maintenance_cleanup() {
+        let configured = RepositoryMaintenanceSpec {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let read_only = effective_maintenance_spec(RepositoryMode::ReadOnly, Some(&configured));
+        assert!(!read_only.enabled);
+
+        let read_write = effective_maintenance_spec(RepositoryMode::ReadWrite, Some(&configured));
+        assert!(read_write.enabled);
+        assert!(
+            effective_maintenance_spec(RepositoryMode::ReadWrite, None).enabled,
+            "maintenance remains default-on for writable repositories"
+        );
+    }
 
     /// The stale-terminal-Job recycle gate: a spec edit must re-bootstrap even
     /// a terminally-`Failed` repository at once (not after the failed Job's
