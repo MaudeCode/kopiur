@@ -40,6 +40,7 @@ pub mod replications;
 pub mod repositories;
 pub mod restores;
 pub mod schedules;
+pub mod snapshot_sort;
 pub mod snapshots;
 pub mod status;
 
@@ -477,6 +478,13 @@ fn non_empty(s: &str) -> Option<String> {
 /// represented.
 pub fn rfc3339(t: &Time) -> Option<String> {
     kopiur_ops::snapshots::meta_time(t).map(|t| t.to_rfc3339())
+}
+
+/// **Pure.** When the object went wrong, as RFC 3339: the newest transition of
+/// its `Stalled=True` / `Ready=False` conditions — the instant the doctor dates
+/// its findings by. `None` while neither holds.
+pub fn failing_since(conditions: &[Condition]) -> Option<String> {
+    kopiur_ops::conditions::failing_since(conditions).map(|t| t.to_rfc3339())
 }
 
 /// **Pure.** The stable display key for a repository reference —

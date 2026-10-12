@@ -21,20 +21,23 @@ The first screen. Answers "is my data safe?" in this order:
    share is remembered. When the pane is too narrow for both (each keeps 440px),
    they stack, **Needs attention first**, and the grip goes.
    - **Needs attention · N** (start) — one list of attention rows
-     (`primitives.md`), worst first: every object that needs someone exactly
+     (`primitives.md`), most recent first (as Recent activity reads), then the
+     rows nothing dates, worst first: every object that needs someone exactly
      once, whether the doctor named it, the status report lists it as stalled, or
      its kind's list shows it unhealthy — the doctor's account wins, then the
      stalled message, then what the list row says. Failing doctor checks about no
      object follow as rows of the same shape. Never a second or third style beside
-     it (no stalled table, no finding cards). Empty state: "Nothing needs you"
-     with the doctor link.
+     it (no stalled table, no finding cards). Beside each pill, how long ago
+     it went wrong (its failing condition's last change; undated when nothing
+     went wrong at an instant), the absolute time on hover. Empty state:
+     "Nothing needs you" with the doctor link.
    - **Recent activity** (end) — every run, newest first, of every kind: each
      snapshot and restore, each replication's last pass, each maintenance
      object's last quick and full run (`components/activity.ts`). A compact row
      per run: chip, kind, name (the whole row opens the drawer), the outcome pill
-     in the run's own word, when, and what ran ("photos → nas · 2.0 KiB · took
-     30s"). Something that never ran is left out. A refused read is named in
-     place.
+     in the run's own word, when (absolute on hover), and what ran ("photos →
+     nas · 2.0 KiB · took 30s"). Something that never ran is left out. A
+     refused read is named in place.
 
 Both lists run the length of the page; nothing is held back behind a count and
 nothing scrolls on its own.

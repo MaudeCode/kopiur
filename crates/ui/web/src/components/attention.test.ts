@@ -80,7 +80,9 @@ describe("attention", () => {
   it("names each object once, however many sources report it", () => {
     const result = attention({
       repositories: [repo("cold", "failed")],
-      stalled: [{ kind: "Snapshot", object: "media/nightly-1", message: "stalled. Fix: wait" }],
+      stalled: [
+        { kind: "Snapshot", object: "media/nightly-1", message: "stalled. Fix: wait", since: null },
+      ],
       checks: [
         check({
           objects: [object({ message: "the mover failed. Fix: re-run it", at: NOW })],
@@ -145,7 +147,7 @@ describe("attention", () => {
       policies: [policy("ledger", { lastSuccessfulSnapshot: null })],
       schedules,
       maintenance,
-      stalled: [{ kind: "Restore", object: "media/of-nothing", message: null }],
+      stalled: [{ kind: "Restore", object: "media/of-nothing", message: null, since: null }],
     });
     expect(result.items.map((i) => [i.target.kind, i.health, i.state])).toEqual([
       ["restore", "failed", "Stalled"],
@@ -192,9 +194,9 @@ describe("attention", () => {
   it("reads a stalled row's kind and coordinates, and drops one it cannot place", () => {
     const result = attention({
       stalled: [
-        { kind: "SnapshotPolicy", object: "media/app", message: "gated" },
-        { kind: "Gizmo", object: "media/x", message: "?" },
-        { kind: "ClusterRepository", object: "shared", message: "down" },
+        { kind: "SnapshotPolicy", object: "media/app", message: "gated", since: null },
+        { kind: "Gizmo", object: "media/x", message: "?", since: null },
+        { kind: "ClusterRepository", object: "shared", message: "down", since: null },
       ],
     });
     expect(result.items.map((i) => i.target)).toEqual([
@@ -217,6 +219,105 @@ describe("attention", () => {
       .join("\n");
     expect(list).not.toMatch(/max-height:/);
     expect(list).not.toMatch(/overflow(-y)?:/);
+  });
+});
+
+describe("attention: dates", () => {
+  const SINCE = "2026-09-08T11:00:00+00:00";
+
+  it("dates each object by when its failing condition last changed", () => {
+    const schedule: ScheduleRow = {
+      namespace: "media",
+      name: "nightly",
+      cron: "0 2 * * *",
+      suspended: false,
+      consecutiveFailures: 2,
+      failingSince: SINCE,
+    };
+    const maintenance = {
+      namespace: "media",
+      name: "nas-maint",
+      repository: "Repository/media/nas",
+      managedByRepository: true,
+      quick: { consecutiveFailures: 1 },
+      full: { consecutiveFailures: 0 },
+      failingSince: SINCE,
+    } as MaintenanceRow;
+    const { items } = attention({
+      repositories: [{ ...repo("nas", "failed"), failingSince: SINCE }],
+      schedules: [schedule],
+      maintenance: [maintenance],
+      replications: {
+        repository: [
+          {
+            namespace: "media",
+            name: "blobsync",
+            source: "nas",
+            cron: "0 5 * * *",
+            suspended: false,
+            phase: "failed",
+            failingSince: SINCE,
+          },
+        ],
+        snapshot: [
+          {
+            namespace: "media",
+            name: "offsite",
+            source: "nas",
+            destination: "shared",
+            cron: "0 6 * * *",
+            suspended: false,
+            phase: "failed",
+            failingSince: SINCE,
+          },
+        ],
+      },
+      stalled: [{ kind: "SnapshotPolicy", object: "media/app", message: "gated", since: SINCE }],
+    });
+    expect(items).toHaveLength(6);
+    expect(items.map((i) => i.at)).toEqual(Array(6).fill(SINCE));
+  });
+
+  it("puts the most recent first, then what has no date, worst first", () => {
+    const at = (iso: string) => ({ ...repo("x", "failed"), failingSince: iso });
+    const { items } = attention({
+      repositories: [
+        { ...at("2026-09-08T09:00:00Z"), name: "oldest" },
+        { ...repo("undated-degraded", "degraded") },
+        { ...at("2026-09-08T11:30:00Z"), name: "newest", health: "degraded" },
+        { ...repo("undated-failed", "failed") },
+        { ...at("2026-09-08T10:00:00Z"), name: "middle" },
+      ],
+    });
+    expect(items.map((i) => i.target.name)).toEqual([
+      "newest",
+      "middle",
+      "oldest",
+      "undated-failed",
+      "undated-degraded",
+    ]);
+  });
+
+  it("keeps the doctor's account but takes a date another source knows", () => {
+    const { items } = attention({
+      checks: [
+        check({
+          check: "repos-ready",
+          objects: [
+            object({ kind: "repository", name: "nas", message: "nas is not Ready", at: null }),
+          ],
+        }),
+      ],
+      repositories: [{ ...repo("nas", "failed"), failingSince: SINCE }],
+    });
+    expect(items).toHaveLength(1);
+    expect(items[0]?.problems).toEqual([{ what: "nas is not Ready" }]);
+    expect(items[0]?.at).toBe(SINCE);
+  });
+
+  it("leaves a policy that never succeeded undated: nothing went wrong at an instant", () => {
+    const { items } = attention({ policies: [policy("app", { lastSuccessfulSnapshot: null })] });
+    expect(items[0]?.at).toBeUndefined();
   });
 });
 
