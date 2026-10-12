@@ -88,6 +88,27 @@ pub const SESSION_BROWSE: &str = "browse";
 /// `<kind>-<name>` (e.g. `Repository-nas`). One warm session per repository:
 /// the CLI selects on this so two snapshots in the same repository share a pod.
 pub const SESSION_REPO_LABEL: &str = "kopiur.home-operations.com/session-repo";
+/// Label on a browse session `Job` that loads copies of credential Secrets
+/// living in another namespace, which the operator writes for it. The
+/// operator watches only Jobs carrying it, with [`SESSION_CREDS_PROJECTED`].
+pub const SESSION_CREDS_LABEL: &str = "kopiur.home-operations.com/session-creds";
+/// [`SESSION_CREDS_LABEL`] value: the session's credentials are projected.
+pub const SESSION_CREDS_PROJECTED: &str = "projected";
+/// Annotation naming the `Snapshot` (in the Job's own namespace) a browse
+/// session was started for. The operator re-checks that snapshot's pinned
+/// `credentialProjection` before copying anything, so a Job alone, without a
+/// snapshot that opted in, never gets credentials.
+pub const SESSION_SNAPSHOT_ANNOTATION: &str = "kopiur.home-operations.com/session-snapshot";
+/// Annotation the operator writes on a projected browse session `Job` when it
+/// will not copy the credentials, holding why and what to change; removed once
+/// the copy is written. The person browsing can read a Job but not its Events,
+/// so this is how the session's wait learns of a refusal and says so at once.
+pub const SESSION_CREDS_REFUSED_ANNOTATION: &str =
+    "kopiur.home-operations.com/session-creds-refused";
+/// How often the operator re-checks a browse session it refused, in seconds.
+/// Shared so a session reused after someone fixed a gate knows how long a
+/// refusal still on the Job may be stale.
+pub const SESSION_CREDS_RECHECK_SECS: u64 = 15;
 
 /// Annotation requesting an out-of-band `Maintenance` run NOW (Flux-style
 /// reconcile trigger). Value: an RFC3339 timestamp; a NEW timestamp requests a
@@ -796,6 +817,9 @@ mod tests {
             OP_LABEL,
             SESSION_LABEL,
             SESSION_REPO_LABEL,
+            SESSION_CREDS_LABEL,
+            SESSION_SNAPSHOT_ANNOTATION,
+            SESSION_CREDS_REFUSED_ANNOTATION,
             RUN_REQUESTED_ANNOTATION,
             RUN_MODE_ANNOTATION,
             ALLOW_IDENTITY_CHANGE_ANNOTATION,
