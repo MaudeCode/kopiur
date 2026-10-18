@@ -515,6 +515,7 @@ pub(super) fn recorded_meta(
     // Does the recipe's explicit context pin the winning effective UID? Covers
     // the Fallback-proceeded-on-explicit case (the explicit context IS the run's
     // identity source then).
+    // `privilegedMode` never picks a UID (#552), so it plays no part here.
     let explicit_uid = explicit.and_then(|m| {
         effective_run_as_user(m.security_context.as_ref(), m.pod_security_context.as_ref())
     });

@@ -378,6 +378,18 @@ pub fn effective_max_concurrent_jobs(
         .and_then(|n| std::num::NonZeroUsize::new(n as usize))
 }
 
+/// The longest `Job` name that stays valid once Kubernetes derives child object
+/// names from it (#547): **57**, not 63.
+///
+/// Kubernetes 1.37's `WorkloadWithJob` creates a pod-group template named
+/// `<job>-pgt-0` for each Job, and that name must itself fit the 63-character
+/// DNS-label limit, so a Job name may use at most `63 - len("-pgt-0")` = 57.
+/// (Pod names are not the constraint: they come from `generateName`, which the
+/// apiserver truncates.) Generated Job names are capped to this; a Job whose name
+/// IS a user-chosen CR name (a `Snapshot`'s backup Job, a `Restore`'s Job) cannot
+/// be renamed, so admission warns when such a name is longer.
+pub const JOB_NAME_MAX: usize = 57;
+
 /// The per-repository snapshot-delete batch default when
 /// `concurrency.maxConcurrentDeleteJobs` is absent: one batch at a time
 /// (single-flight). See [`effective_max_concurrent_delete_jobs`].
@@ -649,6 +661,22 @@ pub const SCHEDULE_REPLACEMENT_HELD_CONDITION: &str = "ReplacementHeld";
 pub const WAITING_FOR_REPOSITORY_SLOT_REASON: &str = "WaitingForRepositorySlot";
 /// `reason` for [`SCHEDULE_REPLACEMENT_HELD_CONDITION`] = `False` (not held).
 pub const REPLACEMENT_NOT_HELD_REASON: &str = "ReplacementNotHeld";
+
+/// `SnapshotSchedule` condition recording that `concurrencyPolicy: Forbid` (or
+/// `Replace`) is holding a due slot because a run this schedule did NOT start —
+/// a manual `kubectl kopiur snapshot now`, another schedule's run, or a
+/// hand-written `Snapshot` — is still in flight for one of the slot's target
+/// policies (#584). The slot fires once that run finishes; `Replace` never
+/// cancels a run it does not own.
+///
+/// Deliberately **not** a registered structural gate: it needs no human and
+/// clears on its own. It exists so the wait is visible in `status`, and so the
+/// accompanying Normal event fires once on entering the hold.
+pub const SCHEDULE_HELD_BY_OTHER_RUN_CONDITION: &str = "HeldByOtherRun";
+/// `reason`/Event reason for [`SCHEDULE_HELD_BY_OTHER_RUN_CONDITION`] = `True`.
+pub const OTHER_RUN_ACTIVE_REASON: &str = "OtherRunActive";
+/// `reason` for [`SCHEDULE_HELD_BY_OTHER_RUN_CONDITION`] = `False` (not held).
+pub const NO_OTHER_RUN_ACTIVE_REASON: &str = "NoOtherRunActive";
 
 /// `Restore` condition recording whether the object this restore's repository
 /// is DERIVED from exists. Set `False` (with

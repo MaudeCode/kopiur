@@ -719,6 +719,13 @@ async fn spawn_maintenance_job(
             .and_then(|m| m.ttl_seconds_after_finished),
     );
     let privileged_mode = maint.spec.mover.as_ref().and_then(|m| m.privileged_mode);
+    // A no-op today (maintenance touches only the repository; see
+    // `MoverOperation::privileged_capabilities`), routed through the same rule as backup
+    // and restore so the per-operation grant has one definition.
+    let resolved_mover = resolved_mover.with_privileged_mode(
+        privileged_mode,
+        kopiur_api::common::MoverOperation::Maintenance,
+    );
     if kopiur_api::common::requires_privilege_resolved(
         Some(&resolved_mover.security_context),
         resolved_mover.pod_security_context.as_ref(),
@@ -774,6 +781,7 @@ async fn spawn_maintenance_job(
         work_spec: &work_spec,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
+        image_pull_secrets: &ctx.mover_image_pull_secrets,
         limits,
         resources: resolved_mover.resources.clone(),
         security_context: resolved_mover.security_context.clone(),

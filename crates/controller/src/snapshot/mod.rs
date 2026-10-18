@@ -896,6 +896,11 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 // standing by a Job-creation patch that failed after the Job was
                 // already created. See `heal_slot_condition_in_flight`.
                 heal_slot_condition_in_flight(&api, backup, &name).await;
+                // #194 defense in depth: the Job exists, so a standing
+                // `MoverPermitted` != True is stale. Live-based patch, after the
+                // store-copy `snapshot_ready_status` write above; a no-op (no GET)
+                // in the steady state.
+                io::clear_stale_mover_permitted_in_flight(&api, backup).await;
                 return Ok(Action::requeue(Duration::from_secs(30)));
             }
         }
@@ -1392,6 +1397,19 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             .as_ref()
             .and_then(|m| m.ttl_seconds_after_finished),
     );
+    // `privilegedMode` grants a ROOT backup (`runAsUser: 0`, set by the user — it never
+    // changes the UID) DAC_OVERRIDE so it can read files owned by any uid/gid (#552); for
+    // any other UID it is inert and warns. Applied BEFORE the identity is recorded and the
+    // gate runs, so both see what the Job will actually run as.
+    // Re-published on every pre-launch pass by design: the kube-runtime Recorder folds an
+    // identical Event (same reason/note/regarding, within its TTL) into ONE object with a
+    // climbing `series.count` (`io::event_ref` strips the churning resourceVersion so the
+    // key matches), so this never mints a new Event per pass.
+    let (resolved_mover, privileged_effect) = resolved_mover
+        .with_privileged_mode_effect(privileged_mode, kopiur_api::common::MoverOperation::Backup);
+    if let Some(msg) = privileged_effect.warning() {
+        io::publish_warning_event(ctx, backup, "PrivilegedModeInert", "Reconcile", &msg).await;
+    }
 
     // Record the RESOLVED mover identity on the kopia snapshot itself (the
     // `kopiur-meta` tag) AND on `status.recorded` below — one value feeds both,
@@ -1532,10 +1550,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     }
     // Permitted: clear any stale `MoverPermitted=False` from a prior reconcile.
     // Live-based (see `io::clear_work_condition_if_stale`) — the #464 heal ran
-    // above and this patch replaces the array it wrote.
+    // above and this patch replaces the array it wrote. `StaleCheck::Live`: the
+    // start-of-pass store copy may predate our own `MoverPermitted=False` echo, and
+    // a clear skipped here is never revisited once the Job exists (#194).
     io::clear_work_condition_if_stale(
         &api,
         backup,
+        io::StaleCheck::Live,
         MOVER_PERMITTED_CONDITION,
         "Permitted",
         "the mover is permitted in this namespace",
@@ -1652,8 +1673,16 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             "credentials Secret(s) present in the mover namespace",
         )
     };
-    io::clear_work_condition_if_stale(&api, backup, CREDENTIALS_AVAILABLE_CONDITION, reason, note)
-        .await?;
+    // Live for the same #194 reason as the MoverPermitted clear above.
+    io::clear_work_condition_if_stale(
+        &api,
+        backup,
+        io::StaleCheck::Live,
+        CREDENTIALS_AVAILABLE_CONDITION,
+        reason,
+        note,
+    )
+    .await?;
     let creds_secrets = io::plain_creds(creds.names);
 
     // ADR §4.8: beforeSnapshot hooks (quiesce/flush) run to completion BEFORE the
@@ -1992,6 +2021,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         work_spec: &work_spec,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
+        image_pull_secrets: &ctx.mover_image_pull_secrets,
         limits,
         resources: resolved_mover.resources.clone(),
         // The fully-merged contexts (hardened ⊂ moverDefaults ⊂ recipe) — the same
@@ -4179,8 +4209,9 @@ async fn launch_batch_job(
 /// lives), the repository's `moverDefaults` inheritance, and RBAC minting — but
 /// with per-member items, NO `ttlSecondsAfterFinished` (explicit reaping), the
 /// sorted-UID members annotation, and an ownerRef ONLY for a namespaced
-/// `Repository` (a `ClusterRepository`'s cluster-scoped owner would be an
-/// un-GC'able ref on a namespaced Job — labels + the reaper stand in instead).
+/// `Repository` (labels + the reaper stand in for a `ClusterRepository`; see the
+/// strip below), and the repository's effective kopia cache (#582,
+/// [`crate::cache::snapdel_cache_plan`]).
 ///
 /// `src_namespace`/`src_name` are the TRIGGERING CR's coordinates, used only to
 /// enrich a credentials-resolution error with the stuck-finalizer escape hatch.
@@ -4202,9 +4233,12 @@ async fn build_batch_job(
             anchor: m.anchor.clone(),
         })
         .collect();
-    // A ClusterRepository owner is cluster-scoped — the resulting ownerRef on a
-    // namespaced Job is invalid and never GC'd. Only a namespaced Repository owns
-    // its batch Job; the ownerRef is stripped below for a ClusterRepository.
+    // The repository CR. It owns the dedicated persistent cache PVC for either kind
+    // (Kubernetes GC lets a namespaced dependent name a cluster-scoped owner; only
+    // the reverse, a cluster-scoped dependent with a namespaced owner, is invalid).
+    // The batch JOB keeps it only for a namespaced Repository: for a
+    // ClusterRepository it is stripped below and the Job is reaped by label + the
+    // explicit reaper, which is what every placement relies on anyway.
     let owner = repo.owner_ref.clone();
     // Creds in the placement namespace with projection HARDCODED OFF (same
     // rationale as the retired cross-namespace path): the batch runs at the
@@ -4228,6 +4262,18 @@ async fn build_batch_job(
         ctx.metrics.inc_secrets_projected(job_ns, creds.projected);
     }
     let creds_secrets = io::plain_creds(creds.names);
+    // #582: honor the repository's `moverDefaults.cache` (volume AND budgets). A
+    // delete loads the repository index like a backup does, so an always-emptyDir
+    // cache re-downloaded the whole index on every batch Job.
+    let effective_cache = crate::cache::effective_cache(repo, None);
+    let cache_plan = crate::cache::snapdel_cache_plan(
+        effective_cache.as_ref(),
+        kopiur_api::consts::effective_max_concurrent_delete_jobs(repo.concurrency.as_ref()),
+        &crate::naming::snapdel_cache_pvc_name(repo_ref),
+    );
+    let cache_volume =
+        crate::cache::resolve_snapdel_cache_volume(&ctx.client, job_ns, owner.clone(), &cache_plan)
+            .await?;
     let work_spec = MoverWorkSpec {
         version: 1,
         operation: Operation::SnapshotDeleteBatch(SnapshotDeleteBatchOp { items }),
@@ -4246,8 +4292,8 @@ async fn build_batch_job(
         },
         hook_plan: Default::default(),
         options: MoverOptions::default(),
-        cache: Default::default(),
-        throttle: Default::default(),
+        cache: crate::cache::cache_tuning(effective_cache.as_ref()),
+        throttle: io::throttle_spec(repo.mover_defaults.as_ref()),
     };
     // Annotation: the SORTED member UID set — the single source of truth for
     // "which Snapshots".
@@ -4289,6 +4335,7 @@ async fn build_batch_job(
         work_spec: &work_spec,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
+        image_pull_secrets: &ctx.mover_image_pull_secrets,
         limits,
         resources: resolved_mover.resources.clone(),
         security_context: resolved_mover.security_context.clone(),
@@ -4309,13 +4356,13 @@ async fn build_batch_job(
         passthrough_env: ctx.mover_env_passthrough.clone(),
         extra_env: Vec::new(),
         annotations,
-        cache_volume: Default::default(),
+        cache_volume,
         scratch_volume: None,
         readiness_exec: None,
     };
     let mut job = jobs::build_job(&inputs)?;
-    // ClusterRepository: drop the cluster-scoped (un-GC'able) ownerRef; the Job is
-    // reaped by label + the explicit reaper instead.
+    // ClusterRepository: the Job carries no ownerRef and is reaped by label + the
+    // explicit reaper instead (the reaper is the only cleanup for every placement).
     if repo_ref.kind == RepositoryKind::ClusterRepository {
         job.metadata.owner_references = None;
     }
@@ -4358,7 +4405,7 @@ async fn reconcile_pin(
     let observed = backup.status.as_ref().and_then(|s| s.pinned);
     let steady = Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE);
     let action = pin_decision(desired, observed);
-    let job_name = format!("{name}-pin");
+    let (job_name, legacy_job_name) = pin_job_names(name);
 
     // Cost gate: the common never-pinned Snapshot (spec.pin unset, no pin ever
     // ran) skips the per-pass Job GET entirely. A pin mover may only exist once
@@ -4371,6 +4418,14 @@ async fn reconcile_pin(
     }
 
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
+    // #547 upgrade: a pin Job the previous release launched under the uncapped
+    // name is still this Snapshot's pin mover; finish it rather than launch a
+    // second one under the new name.
+    if let Some(legacy) = legacy_job_name.as_deref()
+        && let Some(job) = job_api.get_opt(legacy).await?
+    {
+        return handle_pin_job(backup, ctx, api, namespace, name, legacy, &job, action).await;
+    }
     if let Some(job) = job_api.get_opt(&job_name).await? {
         return handle_pin_job(backup, ctx, api, namespace, name, &job_name, &job, action).await;
     }
@@ -4443,7 +4498,7 @@ async fn reconcile_pin(
         hook_plan: Default::default(),
         options: MoverOptions::default(),
         cache: Default::default(),
-        throttle: Default::default(),
+        throttle: io::throttle_spec(repo.mover_defaults.as_ref()),
     };
     let mut labels = run_labels(&config, origin);
     labels.insert(
@@ -4492,6 +4547,7 @@ async fn reconcile_pin(
         work_spec: &work_spec,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
+        image_pull_secrets: &ctx.mover_image_pull_secrets,
         limits,
         resources: resolved_mover.resources.clone(),
         security_context: resolved_mover.security_context.clone(),
@@ -4533,6 +4589,17 @@ async fn reconcile_pin(
     io::apply_mover_objects(&ctx.client, namespace, &job_name, None, &job).await?;
     tracing::info!(backup = %name, %snapshot_id, ?action, "created SnapshotPin Job");
     Ok(Action::requeue(Duration::from_secs(15)))
+}
+
+/// The `SnapshotPin` mover Job's name for the `Snapshot` named `snapshot` —
+/// `<snapshot>-pin` capped to [`kopiur_api::consts::JOB_NAME_MAX`] (#547) — and,
+/// when that differs, the uncapped pre-#547 name an in-flight pin Job may still
+/// carry (looked up first, so an upgrade never launches a second pin mover).
+pub(crate) fn pin_job_names(snapshot: &str) -> (String, Option<String>) {
+    let full = format!("{snapshot}-pin");
+    let current = crate::naming::capped_job_name(&full);
+    let legacy = crate::naming::legacy_job_name(&full, &current);
+    (current, legacy)
 }
 
 /// Whether a `{name}-pin` mover Job may exist for this Snapshot — the cheap,
@@ -4944,7 +5011,7 @@ async fn assess_backup_security_context(
         // "by construction" claim hide the fact that nothing had been checked.
         let message = match basis {
             kopiur_api::secctx_compat::CompatBasis::RootMover => {
-                "the mover runs as root (uid 0), so it can read any file".to_string()
+                "the mover runs as root (uid 0) with DAC_OVERRIDE (or equivalent), so it can read any file".to_string()
             }
             kopiur_api::secctx_compat::CompatBasis::ExactUidMatch => format!(
                 "the mover's uid ({}) matches every workload writing to source PVC `{claim}`",

@@ -3509,6 +3509,39 @@ mod recorded_meta_tests {
         assert_eq!(meta.uid, Some(2000));
     }
 
+    /// #552 follow-up: `privilegedMode: true` never picks a UID. With no pinned UID the
+    /// backup runs as the image's non-root user, so the recorded identity stays absent /
+    /// `src: defaults` — never a `uid: 0, src: explicit` a later
+    /// `inheritSecurityContextFrom: {snapshot: {}}` restore would replay as root.
+    #[test]
+    fn privileged_mode_without_a_uid_records_no_uid_src_defaults() {
+        let mover = MoverSpec {
+            privileged_mode: Some(true),
+            ..Default::default()
+        };
+        let resolved = resolve_mover(None, None, None, None, None, None)
+            .with_privileged_mode(Some(true), kopiur_api::common::MoverOperation::Backup);
+        let meta = recorded_meta(&resolved, &InheritOutcome::NotRequested, Some(&mover));
+        assert_eq!(meta.uid, None);
+        assert_eq!(meta.src, RecordedSrc::Defaults);
+    }
+
+    /// The other half: a recipe that pins `runAsUser: 0` itself and sets `privilegedMode`
+    /// records uid 0 attributed to the recipe, as any explicit UID would.
+    #[test]
+    fn privileged_mode_with_explicit_root_records_uid_zero_src_explicit() {
+        let mover = MoverSpec {
+            security_context: Some(sc_uid(0)),
+            privileged_mode: Some(true),
+            ..Default::default()
+        };
+        let resolved = resolve_mover(None, Some(&sc_uid(0)), None, None, None, None)
+            .with_privileged_mode(Some(true), kopiur_api::common::MoverOperation::Backup);
+        let meta = recorded_meta(&resolved, &InheritOutcome::NotRequested, Some(&mover));
+        assert_eq!(meta.uid, Some(0));
+        assert_eq!(meta.src, RecordedSrc::Explicit);
+    }
+
     #[test]
     fn moverdefaults_pinned_uid_records_src_defaults() {
         let defaults = MoverDefaults {
@@ -4130,6 +4163,7 @@ fn render_mover_job(
         work_spec: &ws,
         image: "ghcr.io/kopiur/mover:test",
         image_pull_policy: None,
+        image_pull_secrets: &[],
         limits: JobLimits::default(),
         resources: resolved_mover.resources.clone(),
         security_context: resolved_mover.security_context.clone(),
@@ -4153,6 +4187,94 @@ fn render_mover_job(
         readiness_exec: None,
     })
     .expect("the Job builds")
+}
+
+/// #552: a `privilegedMode: true` root mover's rendered container must actually carry the
+/// capabilities that let root bypass permission checks — added on top of `drop: [ALL]` —
+/// or it is uid 0 with no power over a `0660` file owned by someone else. Pinned through
+/// the same `resolve_mover` → `with_privileged_mode` → `build_job` path the backup and
+/// restore reconcilers take.
+#[test]
+fn privileged_mode_root_mover_job_carries_the_operation_capabilities() {
+    use k8s_openapi::api::core::v1::SecurityContext;
+    use kopiur_api::common::MoverOperation;
+    let root = SecurityContext {
+        run_as_user: Some(0),
+        run_as_non_root: Some(false),
+        ..Default::default()
+    };
+    let cases: [(MoverOperation, Option<bool>, &[&str]); 4] = [
+        (MoverOperation::Backup, Some(true), &["DAC_OVERRIDE"]),
+        (
+            MoverOperation::Restore,
+            Some(true),
+            &["CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID"],
+        ),
+        (MoverOperation::Backup, None, &[]),
+        (MoverOperation::Restore, None, &[]),
+    ];
+    for (op, privileged_mode, want) in cases {
+        let resolved = kopiur_api::common::resolve_mover(None, Some(&root), None, None, None, None)
+            .with_privileged_mode(privileged_mode, op);
+        let job = render_mover_job(BTreeMap::new(), &resolved);
+        let sc = job
+            .spec
+            .as_ref()
+            .expect("spec")
+            .template
+            .spec
+            .as_ref()
+            .expect("pod spec")
+            .containers[0]
+            .security_context
+            .clone()
+            .expect("container securityContext");
+        assert_eq!(sc.run_as_user, Some(0), "{op:?}");
+        assert_eq!(sc.run_as_non_root, Some(false), "{op:?}");
+        let caps = sc.capabilities.expect("capabilities");
+        assert_eq!(caps.drop, Some(vec!["ALL".to_string()]), "{op:?}");
+        let added = caps.add.unwrap_or_default();
+        assert_eq!(
+            added,
+            want.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+            "{op:?} {privileged_mode:?}"
+        );
+    }
+}
+
+/// #552 follow-up: `privilegedMode` with no pinned UID renders exactly the hardened
+/// non-root Job it would without `privilegedMode` — no capabilities, no `runAsUser`,
+/// `runAsNonRoot: true` kept.
+#[test]
+fn privileged_mode_without_a_uid_renders_the_unprivileged_container() {
+    use kopiur_api::common::MoverOperation;
+    for op in [MoverOperation::Backup, MoverOperation::Restore] {
+        let plain = kopiur_api::common::resolve_mover(None, None, None, None, None, None);
+        let privileged = plain.clone().with_privileged_mode(Some(true), op);
+        let sc_of = |r: &kopiur_api::common::ResolvedMover| {
+            render_mover_job(BTreeMap::new(), r)
+                .spec
+                .expect("spec")
+                .template
+                .spec
+                .expect("pod spec")
+                .containers[0]
+                .security_context
+                .clone()
+                .expect("container securityContext")
+        };
+        let sc = sc_of(&privileged);
+        assert_eq!(sc, sc_of(&plain), "{op:?}");
+        assert_eq!(sc.run_as_user, None, "{op:?}");
+        assert_eq!(sc.run_as_non_root, Some(true), "{op:?}");
+        assert!(
+            sc.capabilities
+                .and_then(|c| c.add)
+                .unwrap_or_default()
+                .is_empty(),
+            "{op:?}"
+        );
+    }
 }
 
 fn rendered_labels(job: &k8s_openapi::api::batch::v1::Job) -> BTreeMap<String, String> {
@@ -4300,6 +4422,7 @@ fn backup_mover_defaults_pod_metadata_reaches_the_pod_template() {
         work_spec: &ws,
         image: "ghcr.io/kopiur/mover:test",
         image_pull_policy: None,
+        image_pull_secrets: &[],
         limits: JobLimits::default(),
         resources: resolved_mover.resources.clone(),
         security_context: resolved_mover.security_context.clone(),
@@ -5139,4 +5262,358 @@ fn the_missing_source_pvc_park_does_not_resurrect_the_inherit_hold() {
         row["status"], "True",
         "the park must not re-report a block that has cleared: {status:#}"
     );
+}
+
+// --- #582: snapdel batch Jobs honor the repository's mover cache ------------
+
+type RequestLog = Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>;
+
+/// A request-logging mock apiserver for `build_batch_job`: the persistent cache PVC
+/// is absent (GET → 404) and its CREATE succeeds; every other call is a 500, so an
+/// unexpected API dependency fails the test loudly instead of passing by accident.
+fn snapdel_cache_client(log: RequestLog) -> kube::Client {
+    use http::{Request, Response, StatusCode};
+    use kube::client::Body;
+    let svc = tower::service_fn(move |req: Request<Body>| {
+        let log = log.clone();
+        async move {
+            let (method, path) = (req.method().clone(), req.uri().path().to_string());
+            let bytes = http_body_util::BodyExt::collect(req.into_body())
+                .await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            log.lock()
+                .unwrap()
+                .push((format!("{method} {path}"), body.clone()));
+            let pvc_path = path.contains("/persistentvolumeclaims");
+            let not_found = serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404,
+            });
+            let (status, response) = if method == http::Method::GET && path.ends_with("/secrets") {
+                // The stale-projected-copy sweep: nothing to reap.
+                (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "kind": "SecretList", "apiVersion": "v1", "metadata": {}, "items": [],
+                    }),
+                )
+            } else if method == http::Method::GET && path.ends_with("/secrets/creds") {
+                // The repository password Secret exists in the Job namespace.
+                (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "kind": "PartialObjectMetadata", "apiVersion": "meta.k8s.io/v1",
+                        "metadata": { "name": "creds", "namespace": "kopiur-system" },
+                    }),
+                )
+            } else if method == http::Method::GET && path.contains("/secrets/") {
+                (StatusCode::NOT_FOUND, not_found)
+            } else if pvc_path && method == http::Method::GET {
+                (
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({
+                        "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                        "reason": "NotFound", "code": 404,
+                    }),
+                )
+            } else if pvc_path && method == http::Method::POST {
+                (StatusCode::CREATED, body)
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({
+                        "kind": "Status", "apiVersion": "v1", "status": "Failure", "code": 500,
+                    }),
+                )
+            };
+            Ok::<_, std::convert::Infallible>(
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&response).unwrap()))
+                    .unwrap(),
+            )
+        }
+    });
+    kube::Client::new(svc, "default")
+}
+
+/// The #582 reporter's repository: a `ClusterRepository` whose `moverDefaults.cache`
+/// is `cache`, with its credentials in the operator namespace (where its snapdel
+/// Jobs run).
+fn snapdel_repo(cache: serde_json::Value) -> (RepositoryRef, io::ResolvedRepository) {
+    let mut repo = resolved_s3_repo();
+    repo.kind = RepositoryKind::ClusterRepository;
+    repo.repo_namespace = None;
+    repo.encryption.password_secret_ref.namespace = Some("kopiur-system".into());
+    repo.owner_ref = OwnerReference {
+        api_version: crate::consts::API_VERSION.into(),
+        kind: "ClusterRepository".into(),
+        name: "garage".into(),
+        uid: "uid-garage".into(),
+        controller: Some(true),
+        block_owner_deletion: Some(false),
+    };
+    repo.mover_defaults = Some(
+        serde_json::from_value(serde_json::json!({ "cache": cache })).expect("valid moverDefaults"),
+    );
+    let repo_ref = RepositoryRef {
+        kind: RepositoryKind::ClusterRepository,
+        name: "garage".into(),
+        namespace: None,
+    };
+    (repo_ref, repo)
+}
+
+fn snapdel_member() -> PendingMember {
+    PendingMember {
+        namespace: "media".into(),
+        name: "app-20260101000000".into(),
+        uid: "0b0f6a3e-4c1d-4b7a-9f2e-5d8c7a6b5e4f".into(),
+        snapshot_id: "k0123456789abcdef".into(),
+        anchor: kopiur_mover::workspec::SnapshotAnchor::default(),
+        external: false,
+        deletion_timestamp: chrono::DateTime::from_timestamp(1, 0).unwrap(),
+        pinned: true,
+        schedule_owned: false,
+    }
+}
+
+fn job_cache_claim(job: &Job) -> Option<String> {
+    job.spec
+        .as_ref()?
+        .template
+        .spec
+        .as_ref()?
+        .volumes
+        .as_ref()?
+        .iter()
+        .find_map(|v| {
+            v.persistent_volume_claim
+                .as_ref()
+                .map(|p| p.claim_name.clone())
+        })
+}
+
+fn job_work_spec(job: &Job) -> MoverWorkSpec {
+    let pod = job.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+    let raw = pod.containers[0]
+        .env
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|e| e.name == kopiur_mover::jobs::WORK_SPEC_ENV)
+        .and_then(|e| e.value.clone())
+        .expect("work spec rides the env");
+    serde_json::from_str(&raw).expect("work spec decodes")
+}
+
+#[tokio::test]
+async fn a_persistent_repo_cache_gives_snapdel_a_dedicated_owned_pvc() {
+    let log: RequestLog = Arc::default();
+    let ctx = Context::test_context(snapdel_cache_client(log.clone()));
+    let (repo_ref, repo) = snapdel_repo(serde_json::json!({
+        "mode": "Persistent", "capacity": "10Gi", "storageClassName": "local-hostpath",
+        "metadataCacheSizeMb": 2048, "contentCacheSizeMb": 512,
+    }));
+    let members = [snapdel_member()];
+    let job_name = batch_job_name(&repo_ref, &members);
+
+    let job = build_batch_job(
+        &ctx,
+        "kopiur-system",
+        &job_name,
+        &repo_ref,
+        &repo,
+        &members,
+        "media",
+        "app-20260101000000",
+    )
+    .await
+    .expect("the batch Job builds");
+
+    let claim = crate::naming::snapdel_cache_pvc_name(&repo_ref);
+    // The Job mounts the dedicated warm cache, not an emptyDir...
+    assert_eq!(job_cache_claim(&job).as_deref(), Some(claim.as_str()));
+    // ...and the cache budgets reach the work spec.
+    let ws = job_work_spec(&job);
+    assert_eq!(ws.cache.metadata_cache_size_mb, Some(2048));
+    assert_eq!(ws.cache.content_cache_size_mb, Some(512));
+
+    // The PVC was created in the Job's namespace, owned by the ClusterRepository.
+    let log = log.lock().unwrap();
+    let (_, created) = log
+        .iter()
+        .find(|(req, _)| req.starts_with("POST") && req.contains("/persistentvolumeclaims"))
+        .expect("the dedicated cache PVC is created");
+    let pvc: k8s_openapi::api::core::v1::PersistentVolumeClaim =
+        serde_json::from_value(created.clone()).expect("a PVC body");
+    assert_eq!(pvc.metadata.name.as_deref(), Some(claim.as_str()));
+    assert_eq!(pvc.metadata.namespace.as_deref(), Some("kopiur-system"));
+    let owners = pvc.metadata.owner_references.unwrap();
+    assert_eq!(owners.len(), 1);
+    assert_eq!(owners[0].kind, "ClusterRepository");
+    assert_eq!(owners[0].uid, "uid-garage");
+    let spec = pvc.spec.unwrap();
+    assert_eq!(spec.storage_class_name.as_deref(), Some("local-hostpath"));
+    assert_eq!(
+        spec.access_modes.as_deref(),
+        Some(&["ReadWriteOnce".to_string()][..])
+    );
+    assert_eq!(
+        spec.resources.unwrap().requests.unwrap()["storage"].0,
+        "10Gi"
+    );
+}
+
+#[tokio::test]
+async fn parallel_snapdel_jobs_never_share_a_persistent_cache_claim() {
+    let log: RequestLog = Arc::default();
+    let ctx = Context::test_context(snapdel_cache_client(log.clone()));
+    let (repo_ref, mut repo) = snapdel_repo(serde_json::json!({
+        "mode": "Persistent", "capacity": "10Gi", "storageClassName": "local-hostpath",
+    }));
+    repo.concurrency = Some(kopiur_api::common::ConcurrencySpec {
+        max_concurrent_delete_jobs: Some(2),
+        ..Default::default()
+    });
+    let members = [snapdel_member()];
+    let job_name = batch_job_name(&repo_ref, &members);
+    let job = build_batch_job(
+        &ctx,
+        "kopiur-system",
+        &job_name,
+        &repo_ref,
+        &repo,
+        &members,
+        "media",
+        "app-20260101000000",
+    )
+    .await
+    .expect("the batch Job builds");
+
+    assert_eq!(job_cache_claim(&job), None, "no shared RWO claim");
+    let pod = job.spec.unwrap().template.spec.unwrap();
+    let eph = pod
+        .volumes
+        .unwrap()
+        .into_iter()
+        .find_map(|v| v.ephemeral)
+        .expect("a sized ephemeral cache instead");
+    let tmpl = eph.volume_claim_template.unwrap().spec;
+    assert_eq!(tmpl.storage_class_name.as_deref(), Some("local-hostpath"));
+    assert!(
+        !log.lock()
+            .unwrap()
+            .iter()
+            .any(|(req, _)| req.contains("/persistentvolumeclaims")),
+        "the coerced ephemeral cache provisions no PVC"
+    );
+}
+
+// --- #547: pin Job names fit the WorkloadWithJob `<job>-pgt-0` budget --------
+
+/// A repository's `moverDefaults.throttle` caps every mover that talks to its
+/// backend. The snapdel batch Job downloads the repository index like any other,
+/// so it must carry the throttle too, not a default (unthrottled) spec.
+#[tokio::test]
+async fn a_snapdel_batch_job_honors_the_repository_throttle() {
+    let log: RequestLog = Arc::default();
+    let ctx = Context::test_context(snapdel_cache_client(log));
+    let (repo_ref, mut repo) = snapdel_repo(serde_json::json!({}));
+    repo.mover_defaults = Some(
+        serde_json::from_value(serde_json::json!({
+            "throttle": { "downloadBytesPerSecond": 1048576, "readOpsPerSecond": 50 }
+        }))
+        .expect("valid moverDefaults"),
+    );
+    let members = [snapdel_member()];
+    let job_name = batch_job_name(&repo_ref, &members);
+
+    let job = build_batch_job(
+        &ctx,
+        "kopiur-system",
+        &job_name,
+        &repo_ref,
+        &repo,
+        &members,
+        "media",
+        "app-20260101000000",
+    )
+    .await
+    .expect("the batch Job builds");
+
+    let want = io::throttle_spec(repo.mover_defaults.as_ref());
+    assert_ne!(want, kopiur_mover::workspec::ThrottleSpec::default());
+    assert_eq!(job_work_spec(&job).throttle, want);
+}
+
+/// Source guard: no production mover work spec in the controller may hand kopia an
+/// unthrottled `ThrottleSpec::default()`. Every mover that connects to a repository
+/// takes `io::throttle_spec(repo.mover_defaults)`, so a repository's throttle caps
+/// all of its traffic (snapdel and pin once skipped it). Test modules are excluded.
+#[test]
+fn no_production_mover_work_spec_drops_the_repository_throttle() {
+    let sources = [
+        ("snapshot/mod.rs", include_str!("mod.rs")),
+        ("snapshot/build.rs", include_str!("build.rs")),
+        ("restore/mod.rs", include_str!("../restore/mod.rs")),
+        ("maintenance/mod.rs", include_str!("../maintenance/mod.rs")),
+        ("verification.rs", include_str!("../verification.rs")),
+        ("repository.rs", include_str!("../repository.rs")),
+        (
+            "cluster_repository.rs",
+            include_str!("../cluster_repository.rs"),
+        ),
+        (
+            "repository_replication.rs",
+            include_str!("../repository_replication.rs"),
+        ),
+        (
+            "snapshot_replication.rs",
+            include_str!("../snapshot_replication.rs"),
+        ),
+    ];
+    for (file, src) in sources {
+        let production = src.split("#[cfg(test)]\nmod tests {").next().unwrap_or(src);
+        for (i, line) in production.lines().enumerate() {
+            assert!(
+                !line
+                    .trim_start()
+                    .starts_with("throttle: Default::default()"),
+                "{file}:{}: a mover work spec drops the repository throttle; \
+                 use io::throttle_spec(repo.mover_defaults.as_ref())",
+                i + 1
+            );
+        }
+    }
+}
+
+#[test]
+fn a_short_snapshots_pin_job_keeps_its_name_and_needs_no_legacy_lookup() {
+    assert_eq!(pin_job_names("db-1"), ("db-1-pin".to_string(), None));
+}
+
+#[test]
+fn a_long_scheduled_snapshots_pin_job_is_capped_with_a_legacy_fallback() {
+    // A scheduled Snapshot is `<schedule>-<14 digits>`: a 40-char schedule name
+    // makes a 55-char Snapshot, whose `-pin` Job (59) used to be valid but
+    // overflows once Kubernetes appends `-pgt-0`.
+    let snapshot = format!("{}-20260101000000", "s".repeat(40));
+    let (current, legacy) = pin_job_names(&snapshot);
+    assert!(current.len() + "-pgt-0".len() <= 63, "{current}");
+    assert_eq!(current, pin_job_names(&snapshot).0, "deterministic");
+    // The pre-#547 name is still looked up, so an in-flight pin finishes.
+    assert_eq!(legacy, Some(format!("{snapshot}-pin")));
+}
+
+#[test]
+fn an_uncreatable_legacy_pin_name_is_not_looked_up() {
+    // > 63 chars could never have been created, so there is nothing to find.
+    let (current, legacy) = pin_job_names(&"s".repeat(70));
+    assert!(current.len() <= kopiur_api::consts::JOB_NAME_MAX);
+    assert_eq!(legacy, None);
 }

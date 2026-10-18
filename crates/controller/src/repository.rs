@@ -761,6 +761,7 @@ async fn reconcile_repository_server(
         is_cluster: false,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
+        image_pull_secrets: &ctx.mover_image_pull_secrets,
         service_account: ctx.mover_service_account.as_deref(),
     };
 
@@ -1039,8 +1040,9 @@ async fn bootstrap_via_mover(
 ) -> Result<Action> {
     // "discovery" (not "bootstrap"): the FIRST run does bootstrap the
     // repository, but every later run of this Job is a catalog re-scan — the
-    // name follows the recurring purpose users actually see.
-    let job_name = crate::naming::discovery_job_name(name);
+    // name follows the recurring purpose users actually see. Resolved against a
+    // pre-#547 uncapped name still in flight, so an upgrade never double-launches.
+    let job_name = io::discovery_job_name_in_use(&ctx.client, namespace, name).await?;
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
 
     // Honor a `Snapshot`'s reverify nudge: force a re-probe (ORs into the
@@ -1721,6 +1723,7 @@ async fn bootstrap_via_mover(
         work_spec: &work_spec,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
+        image_pull_secrets: &ctx.mover_image_pull_secrets,
         // Bound the bootstrap Job: a pod that never schedules (missing mover SA,
         // image-pull failure) otherwise never reaches a `Failed` condition, so the
         // controller never finalizes and the repository hangs `Initializing` with

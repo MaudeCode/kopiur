@@ -51,6 +51,14 @@ use crate::io;
 /// enough to be noticed without becoming the noise.
 const UNREADABLE_RUN_HOLD_REQUEUE: StdDuration = StdDuration::from_secs(10 * 60);
 
+/// Requeue while a due slot is held by a run this schedule did not start
+/// (`HeldByOtherRun=True`, #584). The schedule OWNS its own children, so their
+/// status changes wake it at once; a manual or other-schedule run is not owned,
+/// so nothing wakes the schedule when it finishes. Poll instead — often enough
+/// that the held slot fires soon after, rarely enough not to spin for the hours
+/// a large backup can take.
+const OTHER_RUN_HOLD_REQUEUE: StdDuration = StdDuration::from_secs(15);
+
 /// Parse Go-style duration strings used in the CRD (`30m`, `1h`, `90s`).
 /// Re-exported from `kopiur-api` so the admission validator and every
 /// reconciler (schedules, maintenance, replication, restore `waitTimeout`)
@@ -98,11 +106,12 @@ pub fn should_fire_now(slot: DateTime<Utc>, now: DateTime<Utc>) -> bool {
 }
 
 /// What a pinned `nextSchedule` recorded about *how* its wall-clock slot was
-/// computed — the two inputs to [`next_fire`] that can change underneath a pin
-/// because either may be INHERITED from the target repository's `scheduleDefaults`.
-/// Both are `None` on legacy pins written before the respective field existed.
+/// computed — the inputs to [`next_fire`] that can change underneath a pin: the
+/// timezone and jitter window (either may be INHERITED from the target repository's
+/// `scheduleDefaults`) and the schedule's own cron expression. Each is `None` on
+/// legacy pins written before the respective field existed.
 ///
-/// A struct rather than two adjacent `Option<&str>` parameters: they are the same
+/// A struct rather than adjacent `Option<&str>` parameters: they are the same
 /// type and would silently swap at a call site.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PinnedSlot<'a> {
@@ -111,6 +120,9 @@ pub struct PinnedSlot<'a> {
     /// `status.nextSchedule.jitter` — the Go-style jitter window the slot was
     /// spread by (`None` also means "this slot carried no jitter").
     pub jitter: Option<&'a str>,
+    /// `status.nextSchedule.cron` — the `spec.schedule.cron` the slot was computed
+    /// from. Never inherited: it is the schedule's own spec value.
+    pub cron: Option<&'a str>,
 }
 
 /// **Pure.** Whether a pinned `nextSchedule` slot must be recomputed because the
@@ -131,7 +143,18 @@ pub struct PinnedSlot<'a> {
 /// re-spelling (`60m` → `1h`) is correctly seen as unchanged: a needless recompute
 /// is not free — it re-anchors `next_fire` at `now`, which can skip a slot whose
 /// jitter offset has not yet elapsed.
+///
+/// The cron arm (#545) compares `pinned.cron` against `effective_cron` (the live
+/// `spec.schedule.cron`) with whitespace normalized, for the same reason: re-spacing
+/// `0  3 * * *` is not an edit. It shares the absent-means-unchanged rule, and for
+/// this field that rule is load-bearing, not just churn avoidance. Helm never
+/// upgrades a chart's `crds/` directory, so an apiserver can keep serving a
+/// `SnapshotSchedule` schema that predates `nextSchedule.cron` — and a structural
+/// schema PRUNES unknown fields. On such a cluster every pin this controller writes
+/// comes back without `cron`. If "absent" meant "recompute", every reconcile would
+/// re-pin the slot forward from `now`, and the schedule would never fire again.
 pub fn pin_needs_recompute(
+    effective_cron: &str,
     pinned: PinnedSlot<'_>,
     effective_tz: Tz,
     effective_jitter: Option<&str>,
@@ -140,7 +163,16 @@ pub fn pin_needs_recompute(
     let jitter_changed = pinned
         .jitter
         .is_some_and(|p| jitter_window(Some(p)) != jitter_window(effective_jitter));
-    tz_changed || jitter_changed
+    let cron_changed = pinned
+        .cron
+        .is_some_and(|p| normalize_cron(p) != normalize_cron(effective_cron));
+    tz_changed || jitter_changed || cron_changed
+}
+
+/// A cron expression with runs of whitespace collapsed to single spaces, so the
+/// pin comparison sees `0  3 * * *` and `0 3 * * *` as the same schedule.
+fn normalize_cron(cron: &str) -> String {
+    cron.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Test helper: a repository `scheduleDefaults` carrying ONLY a timezone — the
@@ -227,6 +259,9 @@ struct EffectiveSchedule {
     tz: Tz,
     ambiguity: Option<TimezoneAmbiguity>,
     jitter: Option<String>,
+    /// The `spec.schedule.cron` the slot is computed from, recorded on the pin so
+    /// a later edit to it is detected ([`pin_needs_recompute`]'s cron arm).
+    cron: String,
 }
 
 impl EffectiveSchedule {
@@ -238,12 +273,14 @@ impl EffectiveSchedule {
     /// The `status.nextSchedule` object to pin. `jitter` is emitted as JSON `null`
     /// when no jitter applies, which — under the merge patch `io::patch_status`
     /// issues — DELETES a stale recorded window rather than leaving it to
-    /// (incorrectly) invalidate every future pin.
+    /// (incorrectly) invalidate every future pin. `cron` is always written, so
+    /// every pin site (recompute, skip-expired, fire, first pin) records it.
     fn pin_json(&self, at: DateTime<Utc>) -> serde_json::Value {
         serde_json::json!({
             "at": at.to_rfc3339(),
             "timezone": self.tz.name(),
             "jitter": self.jitter,
+            "cron": self.cron,
         })
     }
 }
@@ -266,6 +303,7 @@ impl EffectiveSchedule {
 ///   pin with no recorded zone and no own zone resolves to UTC via [`resolve_tz`].
 ///   No ambiguity is asserted while degraded.
 fn resolve_pinned_slot(
+    cron: &str,
     pinned: PinnedSlot<'_>,
     resolution: &ScheduleResolution,
 ) -> (EffectiveSchedule, bool) {
@@ -279,8 +317,9 @@ fn resolve_pinned_slot(
                 tz: *tz,
                 ambiguity: ambiguity.clone(),
                 jitter: jitter.clone(),
+                cron: cron.to_string(),
             },
-            pin_needs_recompute(pinned, *tz, jitter.as_deref()),
+            pin_needs_recompute(cron, pinned, *tz, jitter.as_deref()),
         ),
         ScheduleResolution::Degraded { own_tz, own_jitter } => {
             // Per half: the schedule's own value if it set one (authoritative — no
@@ -292,17 +331,22 @@ fn resolve_pinned_slot(
                 .or_else(|| pinned.jitter.map(str::to_string));
             // Mask each INHERITED half to absent on the pinned side: an absent
             // recorded value never recomputes, so an unreadable referent cannot move
-            // the pin. An OWN half is compared for real.
+            // the pin. An OWN half is compared for real. The cron is never
+            // inherited — it is the schedule's own spec value, read without any
+            // lookup — so it is never masked: a cron edit invalidates the pin even
+            // on a degraded pass.
             let masked = PinnedSlot {
                 timezone: own_tz.and(pinned.timezone),
                 jitter: own_jitter.as_ref().and(pinned.jitter),
+                cron: pinned.cron,
             };
-            let needs_recompute = pin_needs_recompute(masked, tz, jitter.as_deref());
+            let needs_recompute = pin_needs_recompute(cron, masked, tz, jitter.as_deref());
             (
                 EffectiveSchedule {
                     tz,
                     ambiguity: None,
                     jitter,
+                    cron: cron.to_string(),
                 },
                 needs_recompute,
             )
@@ -323,7 +367,7 @@ fn resolve_pinned_slot(
 ///   differs, so a first pin that recorded none is never revisited — an
 ///   un-jittered self-heal would be permanent for a schedule that explicitly asked
 ///   for a window.
-fn first_pin(resolution: &ScheduleResolution) -> EffectiveSchedule {
+fn first_pin(cron: &str, resolution: &ScheduleResolution) -> EffectiveSchedule {
     match resolution {
         ScheduleResolution::Resolved {
             tz,
@@ -333,11 +377,13 @@ fn first_pin(resolution: &ScheduleResolution) -> EffectiveSchedule {
             tz: *tz,
             ambiguity: ambiguity.clone(),
             jitter: jitter.clone(),
+            cron: cron.to_string(),
         },
         ScheduleResolution::Degraded { own_tz, own_jitter } => EffectiveSchedule {
             tz: own_tz.unwrap_or(Tz::UTC),
             ambiguity: None,
             jitter: own_jitter.clone(),
+            cron: cron.to_string(),
         },
     }
 }
@@ -488,13 +534,14 @@ fn schedule_ready_status(
         REPLACEMENT_NOT_HELD_REASON, SCHEDULE_REPLACEMENT_HELD_CONDITION,
         WAITING_FOR_REPOSITORY_SLOT_REASON,
     };
-    // Split the one hold into the two independent conditions it feeds, so each
+    // Split the one hold into the independent conditions it feeds, so each
     // is written from a single place with BOTH polarities (a set-only condition
     // would report a resolved outage forever). Exhaustive over `ScheduleHold`.
-    let (blocked, parked) = match hold {
-        None => (None, None),
-        Some(ScheduleHold::Unreadable(b)) => (Some(b), None),
-        Some(ScheduleHold::ParkedRun(name)) => (None, Some(name)),
+    let (blocked, parked, other) = match hold {
+        None => (None, None, None),
+        Some(ScheduleHold::Unreadable(b)) => (Some(b), None, None),
+        Some(ScheduleHold::ParkedRun(name)) => (None, Some(name), None),
+        Some(ScheduleHold::OtherRun(name)) => (None, None, Some(name)),
     };
     let existing = schedule
         .status
@@ -588,6 +635,26 @@ fn schedule_ready_status(
         &parked_message,
         Some(generation),
     );
+    // Held by a run this schedule did not start (#584). Both polarities, for the
+    // same reason as the parked marker: it is the event's transition guard.
+    let (other_reason, other_message) = match other {
+        Some(run) => (
+            kopiur_api::consts::OTHER_RUN_ACTIVE_REASON,
+            other_run_message(&schedule.namespace().unwrap_or_default(), run),
+        ),
+        None => (
+            kopiur_api::consts::NO_OTHER_RUN_ACTIVE_REASON,
+            "no run outside this schedule is holding it".to_string(),
+        ),
+    };
+    let conditions = io::upsert_condition(
+        &conditions,
+        kopiur_api::consts::SCHEDULE_HELD_BY_OTHER_RUN_CONDITION,
+        other.is_some(),
+        other_reason,
+        &other_message,
+        Some(generation),
+    );
     // Fan-out cap condition (#368): asserted (both polarities, so a fixed
     // recipe self-clears) ONLY on fire passes — `None` on wait/hold passes
     // leaves the recorded value untouched, so the condition persists between
@@ -646,6 +713,33 @@ enum ScheduleHold<'a> {
     /// `concurrencyPolicy: Replace` waiting on a run parked behind its
     /// repository's concurrency cap — `ReplacementHeld=True`. Self-clears.
     ParkedRun(&'a str),
+    /// `Forbid`/`Replace` waiting on a `Running` run of the same policy that this
+    /// schedule did not start (manual, another schedule, hand-written) —
+    /// `HeldByOtherRun=True` (#584). Clears when that run finishes.
+    OtherRun(&'a str),
+}
+
+/// The user-facing text for a slot held by another run: names the blocking
+/// `Snapshot` (always in the schedule's namespace) and says it was not started by
+/// this schedule. Only a `Running` foreign run holds a slot ([`slot_blockers`]).
+fn other_run_message(namespace: &str, run: &str) -> String {
+    format!(
+        "Waiting for Snapshot {namespace}/{run} (a manual or other run of this policy) to finish."
+    )
+}
+
+/// Whether `status.conditions` already records the held-by-another-run state —
+/// the transition guard for its Normal event (see
+/// [`recorded_held_by_parked_run`]).
+fn recorded_held_by_other_run(schedule: &SnapshotSchedule) -> bool {
+    schedule
+        .status
+        .as_ref()
+        .map(|s| s.conditions.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .find(|c| c.type_ == kopiur_api::consts::SCHEDULE_HELD_BY_OTHER_RUN_CONDITION)
+        .is_some_and(|c| c.status == "True")
 }
 
 /// Whether `status.conditions` already records the `Replace`-held-by-parked-run
@@ -662,6 +756,52 @@ fn recorded_held_by_parked_run(schedule: &SnapshotSchedule) -> bool {
         .iter()
         .find(|c| c.type_ == kopiur_api::consts::SCHEDULE_REPLACEMENT_HELD_CONDITION)
         .is_some_and(|c| c.status == "True")
+}
+
+/// What the not-due `Wait` path computed this pass that a status patch would
+/// record. A struct so the boolean inputs of [`wait_needs_status_patch`] cannot
+/// be swapped at the call site.
+#[derive(Debug, Clone, Copy, Default)]
+struct WaitFacts {
+    /// The `TimezoneDefaultAmbiguous` state this pass resolved.
+    tz_ambiguous: bool,
+    /// Whether `Replace` is holding this slot behind a parked run.
+    parked: bool,
+    /// Whether a run this schedule did not start is holding this slot (#584).
+    other_run: bool,
+}
+
+/// Whether `status.observedGeneration` lags `metadata.generation` — a spec edit
+/// the status does not describe yet. An absent generation counts as `0`, matching
+/// what [`schedule_ready_status`] writes, so this can never request a patch forever.
+fn observed_generation_stale(schedule: &SnapshotSchedule) -> bool {
+    let generation = schedule.metadata.generation.unwrap_or(0);
+    schedule.status.as_ref().and_then(|s| s.observed_generation) != Some(generation)
+}
+
+/// **Pure.** Whether the not-due `Wait` path must write status this pass. Steady
+/// state is patch-free; a patch is needed when a recorded condition no longer
+/// matches this pass (`now`), when an unreadable-run gate must clear, or when
+/// `observedGeneration` lags a spec edit (#545).
+///
+/// Exhaustive over the resolution: a `Degraded` pass writes nothing, because it
+/// asserts nothing about ambiguity. It does not catch the generation up either —
+/// the next resolved pass does, so a stale generation lasts at most until then.
+fn wait_needs_status_patch(
+    schedule: &SnapshotSchedule,
+    resolution: &ScheduleResolution,
+    now: WaitFacts,
+) -> bool {
+    match resolution {
+        ScheduleResolution::Degraded { .. } => false,
+        ScheduleResolution::Resolved { .. } => {
+            now.tz_ambiguous != recorded_tz_ambiguous(schedule)
+                || recorded_blocked_on_unreadable(schedule)
+                || now.parked != recorded_held_by_parked_run(schedule)
+                || now.other_run != recorded_held_by_other_run(schedule)
+                || observed_generation_stale(schedule)
+        }
+    }
 }
 
 /// Whether `status.conditions` already records the blocked-on-unreadable-run
@@ -780,6 +920,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
     // upgrade never churns the pin.
     let pinned_tz = pinned.and_then(|r| r.timezone.clone());
     let pinned_jitter = pinned.and_then(|r| r.jitter.clone());
+    let pinned_cron = pinned.and_then(|r| r.cron.clone());
 
     if let Some(slot) = pinned_slot {
         // Effective zone/window + whether the pin is stale, honoring Degraded
@@ -789,12 +930,14 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         let recorded = PinnedSlot {
             timezone: pinned_tz.as_deref(),
             jitter: pinned_jitter.as_deref(),
+            cron: pinned_cron.as_deref(),
         };
-        let (eff, needs_recompute) = resolve_pinned_slot(recorded, &resolution);
+        let (eff, needs_recompute) =
+            resolve_pinned_slot(&schedule.spec.schedule.cron, recorded, &resolution);
         let (tz, tz_ambiguity) = (eff.tz, eff.ambiguity.clone());
         let jitter_window = eff.window();
         // If an effective timing input changed since this slot was pinned (a
-        // `spec.schedule.{timezone,jitter}` edit or a repo `scheduleDefaults` change),
+        // `spec.schedule.{cron,timezone,jitter}` edit or a repo `scheduleDefaults` change),
         // the pinned wall-clock instant is stale. Recompute deterministically via the
         // existing `next_fire` (croner + deterministic jitter — NO new randomness)
         // and re-pin with the new inputs without firing; the requeue re-enters and the
@@ -823,7 +966,8 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
                 schedule = %sched_name,
                 from_timezone = ?pinned_tz, to_timezone = %tz.name(),
                 from_jitter = ?pinned_jitter, to_jitter = ?eff.jitter,
-                "schedule timezone or jitter changed; recomputed the next slot"
+                from_cron = ?pinned_cron, to_cron = %eff.cron,
+                "schedule cron, timezone or jitter changed; recomputed the next slot"
             );
             let until = (next - now).to_std().unwrap_or(StdDuration::from_secs(60));
             return Ok(Action::requeue(until.max(StdDuration::from_secs(1))));
@@ -837,6 +981,27 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         };
         let runs = classify_active_runs(&items);
         let disposition = slot_disposition(&schedule.spec.schedule, slot, now, runs.active);
+        // #584: `Forbid` and `Replace` must also see runs this schedule did not
+        // start — a manual `snapshot now`, another schedule, a hand-written CR —
+        // for the same target policy. Only read when the slot is about to fire
+        // (the store read is in-process; a cold store falls back to a live LIST,
+        // and a read error fails CLOSED by propagating, never "nothing running").
+        // A foreign run downgrades the Fire to a Wait BEFORE the `Replace` plan
+        // below is computed, so `Replace` deletes nothing: it never cancels a run
+        // it does not own, and holding the whole slot (its own prior run included)
+        // until the foreign run finishes is the safe answer.
+        let other_run =
+            if needs_other_run_check(schedule.spec.schedule.concurrency_policy, disposition) {
+                let targets = target_policy_refs(ctx, schedule, &namespace).await?;
+                let rows = io::namespace_snapshots(ctx, &namespace).await?;
+                first_foreign_run(&slot_blockers(&rows, &items, &namespace, &targets))
+            } else {
+                None
+            };
+        let disposition = match other_run {
+            Some(_) => SlotDisposition::Wait,
+            None => disposition,
+        };
         // `concurrencyPolicy: Replace` — what to do with the runs this slot is
         // about to replace, decided from the SAME children slice (no extra
         // LIST). Computed BEFORE the blocker filter below because two of its
@@ -873,10 +1038,11 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         // The ONE hold fact every status write below asserts (or clears). The
         // unreadable gate wins when both could apply — `replace_plan` already
         // gives it precedence, so this only re-states that ordering.
-        let hold = match (blocker, parked_hold) {
-            (Some(b), _) => Some(ScheduleHold::Unreadable(b)),
-            (None, Some(p)) => Some(ScheduleHold::ParkedRun(p)),
-            (None, None) => None,
+        let hold = match (blocker, parked_hold, other_run.as_deref()) {
+            (Some(b), _, _) => Some(ScheduleHold::Unreadable(b)),
+            (None, Some(p), _) => Some(ScheduleHold::ParkedRun(p)),
+            (None, None, Some(o)) => Some(ScheduleHold::OtherRun(o)),
+            (None, None, None) => None,
         };
         // A slot expired past `startingDeadlineSeconds` must re-pin forward, or the
         // wait branch below computes `(slot - now)` for a past instant and requeues
@@ -1039,13 +1205,25 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         // successful pass (the pin's own requeue, or the referent watch firing when
         // the policy/repository returns), so a stale `TimezoneDefaultAmbiguous` or
         // `ScheduleRunnable` lingers at most until then and never past the next fire.
+        //
+        // A stale `observedGeneration` also forces the patch (#545): every spec
+        // edit (a `suspend` toggle, a cron edit) bumps `metadata.generation`, and
+        // without this the status — and Ready's reason — would keep describing the
+        // old spec until the next fire.
         let held_recorded = recorded_held_by_parked_run(schedule);
-        let held_now = parked_hold.is_some();
-        if matches!(resolution, ScheduleResolution::Resolved { .. })
-            && (tz_ambiguity.is_some() != recorded_tz_ambiguous(schedule)
-                || recorded_blocked_on_unreadable(schedule)
-                || held_now != held_recorded)
-        {
+        let other_recorded = recorded_held_by_other_run(schedule);
+        let wait_now = WaitFacts {
+            tz_ambiguous: tz_ambiguity.is_some(),
+            parked: parked_hold.is_some(),
+            other_run: other_run.is_some(),
+        };
+        // The hold events below are gated on THIS write: an event fires only on the
+        // pass that records its condition. A `Degraded` pass writes nothing, so it
+        // must emit nothing either — otherwise the unrecorded condition never arms
+        // the transition guard and the event repeats on every requeue (15s for the
+        // other-run hold, 1s for the parked one) for as long as resolution fails.
+        let status_written = wait_needs_status_patch(schedule, &resolution, wait_now);
+        if status_written {
             let (conditions, generation) =
                 schedule_ready_status(schedule, tz_ambiguity.as_ref(), hold, None);
             io::patch_status(
@@ -1066,7 +1244,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         // snapshots` with no explanation. Transition-gated on the condition just
         // written, so it fires once on entering the hold, not once per 1s requeue.
         if let Some(parked) = parked_hold {
-            if !held_recorded {
+            if status_written && !held_recorded {
                 io::publish_normal_event(
                     ctx,
                     schedule,
@@ -1086,6 +1264,27 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
                  mover-Job concurrency cap"
             );
         }
+        // Held by a running run this schedule did not start (#584). Normal, not
+        // Warning: it clears when that run finishes. Transition-gated on the
+        // condition just written, like the parked hold above, so it fires once on
+        // entering the hold.
+        if let Some(other) = other_run.as_deref() {
+            if status_written && !other_recorded {
+                io::publish_normal_event(
+                    ctx,
+                    schedule,
+                    kopiur_api::consts::OTHER_RUN_ACTIVE_REASON,
+                    "AwaitOtherRun",
+                    &other_run_message(&namespace, other),
+                )
+                .await;
+            }
+            tracing::debug!(
+                namespace = %namespace, schedule = %sched_name, other_run = %other,
+                "holding a due slot behind a run of the same policy this schedule did not start"
+            );
+            return Ok(Action::requeue(OTHER_RUN_HOLD_REQUEUE));
+        }
         let until = (slot - now).to_std().unwrap_or(StdDuration::from_secs(1));
         return Ok(Action::requeue(until.max(StdDuration::from_secs(1))));
     }
@@ -1094,7 +1293,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
     // the resolved zone/window, or UTC with no jitter when Degraded (self-heals —
     // once referents recover, the pinned-slot branch recomputes into the inherited
     // zone/window exactly once).
-    let eff = first_pin(&resolution);
+    let eff = first_pin(&schedule.spec.schedule.cron, &resolution);
     let (tz, tz_ambiguity) = (eff.tz, eff.ambiguity.clone());
     let next = next_fire(&schedule.spec.schedule.cron, eff.window(), &seed, now, tz)?;
 
@@ -1109,6 +1308,25 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         .and_then(|s| s.last_schedule.as_ref())
         .is_some();
     if should_run_on_create(&schedule.spec.schedule, already_ran) {
+        // #584: the creation run is a FIRE like any due slot, so `Forbid`/`Replace`
+        // hold it behind a `Running` run of the same policy this schedule did not
+        // start. Nothing is pinned while held, so this branch re-runs and the
+        // creation run still fires once that run finishes. Same pure helpers as the
+        // pinned path; a read error fails CLOSED by propagating.
+        if needs_other_run_check(
+            schedule.spec.schedule.concurrency_policy,
+            SlotDisposition::Fire,
+        ) {
+            let own = children?;
+            let targets = target_policy_refs(ctx, schedule, &namespace).await?;
+            let rows = io::namespace_snapshots(ctx, &namespace).await?;
+            if let Some(other) =
+                first_foreign_run(&slot_blockers(&rows, &own, &namespace, &targets))
+            {
+                return hold_run_on_create(ctx, &api, schedule, &namespace, &other, &tz_ambiguity)
+                    .await;
+            }
+        }
         // metadata.creationTimestamp is a k8s-openapi `Time` wrapping a jiff
         // `Timestamp`; convert via unix seconds to chrono (matches snapshot_policy).
         let anchor = schedule
@@ -1160,6 +1378,57 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
     .await?;
     let until = (next - now).to_std().unwrap_or(StdDuration::from_secs(60));
     Ok(Action::requeue(until.max(StdDuration::from_secs(1))))
+}
+
+/// Hold a `runOnCreate` first fire behind `other`, a `Running` run of the same
+/// policy this schedule did not start (#584). Records `HeldByOtherRun=True` and
+/// emits one Normal event on entering the hold. Nothing is pinned, so the next
+/// pass re-enters the first-pin branch and fires the creation run once `other`
+/// finishes. Transition-gated like the pinned path: while the hold is already
+/// recorded and the generation is current, a pass writes and emits nothing.
+async fn hold_run_on_create(
+    ctx: &Context,
+    api: &Api<SnapshotSchedule>,
+    schedule: &SnapshotSchedule,
+    namespace: &str,
+    other: &str,
+    tz_ambiguity: &Option<TimezoneAmbiguity>,
+) -> Result<Action> {
+    let recorded = recorded_held_by_other_run(schedule);
+    let generation_stale = schedule.status.as_ref().and_then(|s| s.observed_generation)
+        != schedule.metadata.generation;
+    if !recorded || generation_stale {
+        let (conditions, generation) = schedule_ready_status(
+            schedule,
+            tz_ambiguity.as_ref(),
+            Some(ScheduleHold::OtherRun(other)),
+            None,
+        );
+        io::patch_status(
+            api,
+            &schedule.name_any(),
+            serde_json::json!({
+                "observedGeneration": generation,
+                "conditions": conditions,
+            }),
+        )
+        .await?;
+        if !recorded {
+            io::publish_normal_event(
+                ctx,
+                schedule,
+                kopiur_api::consts::OTHER_RUN_ACTIVE_REASON,
+                "AwaitOtherRun",
+                &other_run_message(namespace, other),
+            )
+            .await;
+        }
+    }
+    tracing::debug!(
+        namespace = %namespace, schedule = %schedule.name_any(), other_run = %other,
+        "holding the runOnCreate fire behind a run of the same policy this schedule did not start"
+    );
+    Ok(Action::requeue(OTHER_RUN_HOLD_REQUEUE))
 }
 
 /// A deterministic, slot-stamped Snapshot name so the same slot is idempotent
@@ -1232,6 +1501,143 @@ pub fn classify_active_runs(items: &[Snapshot]) -> ActiveRuns {
         out.active |= unfinished;
     }
     out
+}
+
+/// An unfinished, non-terminating `Snapshot` that bears on a due slot's
+/// concurrency gate, by who started it (#584). An enum, not a bool, so every
+/// consumer must say what it does with each kind — in particular that `Replace`
+/// may only ever cancel an [`ActiveRun::Own`] run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveRun {
+    /// One of this schedule's own children (the `schedule_children`
+    /// population). Gated by [`classify_active_runs`] and, under `Replace`,
+    /// cancellable by [`replace_plan`].
+    Own(String),
+    /// A run of one of this slot's target policies that this schedule did not
+    /// start: a manual `snapshot now`, another schedule's child, a hand-written
+    /// CR. Holds the slot under `Forbid` and `Replace`; never cancelled.
+    Foreign(String),
+}
+
+/// **Pure.** Whether `snapshot`'s typed `spec.policyRef` names one of `targets`.
+/// Both sides resolve an absent `namespace` to their own: the Snapshot's
+/// namespace for its ref, the schedule's for a target. Deliberately the typed
+/// spec reference, never the `CONFIG_LABEL` — labels are user-editable and are
+/// not trusted to identify a recipe.
+fn runs_target_policy(snapshot: &Snapshot, namespace: &str, targets: &[PolicyRef]) -> bool {
+    let Some(pref) = snapshot.spec.policy_ref.as_ref() else {
+        return false;
+    };
+    let snap_ns = snapshot.namespace();
+    let pref_ns = pref
+        .namespace
+        .as_deref()
+        .or(snap_ns.as_deref())
+        .unwrap_or(namespace);
+    targets
+        .iter()
+        .any(|t| t.name == pref.name && t.namespace.as_deref().unwrap_or(namespace) == pref_ns)
+}
+
+/// **Pure** (#584). Which `Snapshot`s in the schedule's namespace block a due
+/// slot, classified [`ActiveRun::Own`] / [`ActiveRun::Foreign`] and sorted by
+/// name so the reported blocker is deterministic. Non-terminating rows only; rows
+/// outside `namespace` are ignored (the store is install-wide).
+///
+/// - **Own** children (`own`) block while unfinished — the concurrency gate's set
+///   (`None` / `Pending` / `Running`), plus `Unknown` (fail closed, as in
+///   [`classify_active_runs`]: a phase written by a newer operator may be a live
+///   run of ours).
+/// - **Foreign** runs of one of the slot's `targets` block only while `Running`,
+///   i.e. actually moving data. A `None`/`Pending` foreign run may be stuck there
+///   indefinitely (no privileged opt-in, missing repository) and must not silence
+///   the schedule; an `Unknown` one is someone else's run and must not wedge us.
+///   Failing open for a foreign run only risks the pre-#584 overlap, never data
+///   loss.
+pub fn slot_blockers(
+    rows: &[Snapshot],
+    own: &[Snapshot],
+    namespace: &str,
+    targets: &[PolicyRef],
+) -> Vec<ActiveRun> {
+    use kopiur_api::SnapshotPhase;
+    let mut out: Vec<ActiveRun> = Vec::new();
+    for row in rows {
+        if row.namespace().as_deref() != Some(namespace)
+            || row.metadata.deletion_timestamp.is_some()
+        {
+            continue;
+        }
+        let phase = row.status.as_ref().and_then(|s| s.phase.as_ref());
+        let name = row.name_any();
+        if own.iter().any(|o| o.name_any() == name) {
+            let unfinished = match phase {
+                None
+                | Some(
+                    SnapshotPhase::Pending | SnapshotPhase::Running | SnapshotPhase::Unknown(_),
+                ) => true,
+                Some(
+                    SnapshotPhase::Succeeded
+                    | SnapshotPhase::Failed
+                    | SnapshotPhase::Deleting
+                    | SnapshotPhase::Discovered
+                    | SnapshotPhase::Unchanged,
+                ) => false,
+            };
+            if unfinished {
+                out.push(ActiveRun::Own(name));
+            }
+        } else if runs_target_policy(row, namespace, targets) {
+            let moving_data = match phase {
+                Some(SnapshotPhase::Running) => true,
+                None
+                | Some(
+                    SnapshotPhase::Pending
+                    | SnapshotPhase::Unknown(_)
+                    | SnapshotPhase::Succeeded
+                    | SnapshotPhase::Failed
+                    | SnapshotPhase::Deleting
+                    | SnapshotPhase::Discovered
+                    | SnapshotPhase::Unchanged,
+                ) => false,
+            };
+            if moving_data {
+                out.push(ActiveRun::Foreign(name));
+            }
+        }
+    }
+    out.sort_by(|a, b| active_run_name(a).cmp(active_run_name(b)));
+    out
+}
+
+/// The `Snapshot` name an [`ActiveRun`] carries, whoever started it.
+fn active_run_name(run: &ActiveRun) -> &str {
+    match run {
+        ActiveRun::Own(name) | ActiveRun::Foreign(name) => name,
+    }
+}
+
+/// **Pure** (#584). The first run in `blockers` this schedule did not start —
+/// the one a held slot names. Own runs are skipped: they are gated by
+/// [`classify_active_runs`] / [`replace_plan`], which already account for them.
+pub fn first_foreign_run(blockers: &[ActiveRun]) -> Option<String> {
+    blockers.iter().find_map(|run| match run {
+        ActiveRun::Own(_) => None,
+        ActiveRun::Foreign(name) => Some(name.clone()),
+    })
+}
+
+/// **Pure** (#584). Whether this pass must look for runs this schedule did not
+/// start. Only a slot that would otherwise FIRE needs the check, and only under
+/// a policy that refuses to overlap runs. Exhaustive over the policy: `Allow`
+/// runs beside anything, as before.
+pub fn needs_other_run_check(policy: ConcurrencyPolicy, disposition: SlotDisposition) -> bool {
+    match policy {
+        ConcurrencyPolicy::Allow => false,
+        ConcurrencyPolicy::Forbid | ConcurrencyPolicy::Replace => {
+            disposition == SlotDisposition::Fire
+        }
+    }
 }
 
 /// What `concurrencyPolicy: Replace` must do with a due slot, given this
@@ -2344,6 +2750,29 @@ mod tests {
     use chrono::TimeZone;
     use kopiur_api::SnapshotPhase;
 
+    /// The effective cron the pure pin tests compute against. Every `PinnedSlot`
+    /// fixture that records no cron (`None`) treats it as unchanged.
+    const CRON: &str = "0 3 * * *";
+
+    /// #547: the admission warning's `<schedule>-<slot>` arithmetic must match
+    /// the name this controller actually mints, or it would warn at the wrong length.
+    #[test]
+    fn the_schedule_name_warning_matches_the_minted_snapshot_name_length() {
+        let slot = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        for len in [42, 43] {
+            let schedule = "s".repeat(len);
+            let minted = scheduled_backup_name(&schedule, slot);
+            let warns =
+                kopiur_api::validate::scheduled_job_name_length_warning(&schedule).is_some();
+            assert_eq!(
+                warns,
+                minted.len() > kopiur_api::consts::JOB_NAME_MAX,
+                "{minted} ({} chars)",
+                minted.len()
+            );
+        }
+    }
+
     fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).single().unwrap()
     }
@@ -2720,6 +3149,7 @@ mod tests {
     /// A pin recording only a timezone — the pre-jitter shape.
     fn pinned_tz_only(tz: &str) -> PinnedSlot<'_> {
         PinnedSlot {
+            cron: None,
             timezone: Some(tz),
             jitter: None,
         }
@@ -2729,11 +3159,13 @@ mod tests {
     fn pin_recompute_only_when_recorded_zone_differs() {
         // Differing recorded zone → recompute (the pin is stale).
         assert!(pin_needs_recompute(
+            CRON,
             pinned_tz_only("America/Chicago"),
             Tz::UTC,
             None
         ));
         assert!(pin_needs_recompute(
+            CRON,
             pinned_tz_only("UTC"),
             "Europe/Berlin".parse().unwrap(),
             None
@@ -2743,8 +3175,14 @@ mod tests {
     #[test]
     fn pin_recompute_equal_zone_keeps_pin_no_churn() {
         // Determinism guard: identical zones never recompute (no jitter churn).
-        assert!(!pin_needs_recompute(pinned_tz_only("UTC"), Tz::UTC, None));
         assert!(!pin_needs_recompute(
+            CRON,
+            pinned_tz_only("UTC"),
+            Tz::UTC,
+            None
+        ));
+        assert!(!pin_needs_recompute(
+            CRON,
             pinned_tz_only("America/Chicago"),
             "America/Chicago".parse().unwrap(),
             None
@@ -2754,8 +3192,14 @@ mod tests {
     #[test]
     fn pin_recompute_legacy_absent_zone_keeps_pin() {
         // A legacy pin (no recorded zone) is treated as unchanged — no upgrade churn.
-        assert!(!pin_needs_recompute(PinnedSlot::default(), Tz::UTC, None));
         assert!(!pin_needs_recompute(
+            CRON,
+            PinnedSlot::default(),
+            Tz::UTC,
+            None
+        ));
+        assert!(!pin_needs_recompute(
+            CRON,
             PinnedSlot::default(),
             "Pacific/Kiritimati".parse().unwrap(),
             None
@@ -2768,19 +3212,20 @@ mod tests {
         // edit to the SnapshotSchedule at all — the pin must go stale, or the change
         // would only take effect an arbitrary slot later.
         let pinned = PinnedSlot {
+            cron: None,
             timezone: Some("UTC"),
             jitter: Some("10m"),
         };
         assert!(
-            pin_needs_recompute(pinned, Tz::UTC, Some("30m")),
+            pin_needs_recompute(CRON, pinned, Tz::UTC, Some("30m")),
             "a widened repo default must invalidate the pin"
         );
         assert!(
-            pin_needs_recompute(pinned, Tz::UTC, None),
+            pin_needs_recompute(CRON, pinned, Tz::UTC, None),
             "a REMOVED repo default must invalidate the pin too"
         );
         assert!(
-            !pin_needs_recompute(pinned, Tz::UTC, Some("10m")),
+            !pin_needs_recompute(CRON, pinned, Tz::UTC, Some("10m")),
             "the unchanged window is the steady state — never recompute"
         );
     }
@@ -2790,10 +3235,11 @@ mod tests {
         // `60m` and `1h` are the same window; a recompute here would be pure churn
         // AND can skip a slot (it re-anchors `next_fire` at `now`).
         let pinned = PinnedSlot {
+            cron: None,
             timezone: Some("UTC"),
             jitter: Some("60m"),
         };
-        assert!(!pin_needs_recompute(pinned, Tz::UTC, Some("1h")));
+        assert!(!pin_needs_recompute(CRON, pinned, Tz::UTC, Some("1h")));
     }
 
     #[test]
@@ -2803,11 +3249,13 @@ mod tests {
         // invalidate every pin in the cluster on the operator upgrade. It is picked
         // up at the next natural re-pin (fire / expiry).
         assert!(!pin_needs_recompute(
+            CRON,
             pinned_tz_only("UTC"),
             Tz::UTC,
             Some("30m")
         ));
         assert!(!pin_needs_recompute(
+            CRON,
             PinnedSlot::default(),
             Tz::UTC,
             Some("30m")
@@ -2815,18 +3263,95 @@ mod tests {
     }
 
     #[test]
+    fn pin_recompute_when_the_recorded_cron_differs() {
+        // #545: a `spec.schedule.cron` edit must invalidate the pin, or the OLD
+        // expression's slot fires one more time.
+        let pinned = PinnedSlot {
+            timezone: Some("UTC"),
+            jitter: None,
+            cron: Some("0 3 * * *"),
+        };
+        assert!(pin_needs_recompute("0 4 * * *", pinned, Tz::UTC, None));
+        assert!(!pin_needs_recompute("0 3 * * *", pinned, Tz::UTC, None));
+    }
+
+    #[test]
+    fn pin_recompute_absent_recorded_cron_keeps_pin() {
+        // A pin with no recorded cron is "unchanged", NOT "recompute". Helm does
+        // not upgrade `crds/`, so an apiserver serving the old schema PRUNES
+        // `nextSchedule.cron` from every pin we write. If absent meant
+        // "recompute", each reconcile would re-pin forward and the schedule
+        // would never fire.
+        assert!(!pin_needs_recompute(
+            "0 4 * * *",
+            PinnedSlot::default(),
+            Tz::UTC,
+            None
+        ));
+        assert!(!pin_needs_recompute(
+            "*/5 * * * *",
+            pinned_tz_only("UTC"),
+            Tz::UTC,
+            None
+        ));
+    }
+
+    #[test]
+    fn pin_recompute_ignores_a_whitespace_respelling_of_the_cron() {
+        let pinned = PinnedSlot {
+            timezone: Some("UTC"),
+            jitter: None,
+            cron: Some("0 3 * * *"),
+        };
+        assert!(!pin_needs_recompute("0  3 *\t* * ", pinned, Tz::UTC, None));
+        assert!(!pin_needs_recompute(" 0 3 * * *", pinned, Tz::UTC, None));
+    }
+
+    #[test]
+    fn a_degraded_pass_still_recomputes_on_a_cron_edit() {
+        // The cron is the schedule's OWN value — no referent lookup is involved —
+        // so a degraded pass (repository unreadable) must still see the edit.
+        let pinned = PinnedSlot {
+            timezone: Some("Europe/Berlin"),
+            jitter: Some("10m"),
+            cron: Some("0 3 * * *"),
+        };
+        let (eff, recompute) = resolve_pinned_slot("0 4 * * *", pinned, &degraded_inherited());
+        assert!(
+            recompute,
+            "a cron edit must invalidate even a degraded pass"
+        );
+        // The inherited halves still hold at the pin's recorded values.
+        assert_eq!(eff.tz.name(), "Europe/Berlin");
+        assert_eq!(eff.jitter.as_deref(), Some("10m"));
+        assert_eq!(eff.pin_json(at(2026, 5, 24, 4, 0))["cron"], "0 4 * * *");
+        // Unchanged cron + degraded = keep the pin.
+        let (_eff, recompute) = resolve_pinned_slot("0 3 * * *", pinned, &degraded_inherited());
+        assert!(!recompute);
+    }
+
+    #[test]
+    fn every_pin_records_the_cron_it_was_computed_from() {
+        let eff = first_pin("15 2 * * *", &resolved("UTC"));
+        assert_eq!(eff.pin_json(at(2026, 5, 24, 2, 15))["cron"], "15 2 * * *");
+        let eff = first_pin("15 2 * * *", &degraded_inherited());
+        assert_eq!(eff.pin_json(at(2026, 5, 24, 2, 15))["cron"], "15 2 * * *");
+    }
+
+    #[test]
     fn pin_recompute_is_the_or_of_both_timing_inputs() {
         // Either input alone invalidates; neither leaves the pin alone. Stated as a
         // truth table so a third timing input can't be added and silently ignored.
         let pinned = PinnedSlot {
+            cron: None,
             timezone: Some("UTC"),
             jitter: Some("10m"),
         };
         let berlin: Tz = "Europe/Berlin".parse().unwrap();
-        assert!(!pin_needs_recompute(pinned, Tz::UTC, Some("10m")));
-        assert!(pin_needs_recompute(pinned, berlin, Some("10m")));
-        assert!(pin_needs_recompute(pinned, Tz::UTC, Some("20m")));
-        assert!(pin_needs_recompute(pinned, berlin, Some("20m")));
+        assert!(!pin_needs_recompute(CRON, pinned, Tz::UTC, Some("10m")));
+        assert!(pin_needs_recompute(CRON, pinned, berlin, Some("10m")));
+        assert!(pin_needs_recompute(CRON, pinned, Tz::UTC, Some("20m")));
+        assert!(pin_needs_recompute(CRON, pinned, berlin, Some("20m")));
     }
 
     #[test]
@@ -2899,7 +3424,7 @@ mod tests {
         // tell this from a resolved UTC, so `pin_needs_recompute(Some("Europe/Berlin"),
         // UTC)` fired and rewrote the pin to UTC timing — then flapped back on recovery.
         let (eff, needs_recompute) =
-            resolve_pinned_slot(pinned_tz_only("Europe/Berlin"), &degraded_inherited());
+            resolve_pinned_slot(CRON, pinned_tz_only("Europe/Berlin"), &degraded_inherited());
         assert!(!needs_recompute, "degrade must never invalidate a live pin");
         // The pin's own recorded zone stays in effect for this reconcile (no flap).
         assert_eq!(eff.tz.name(), "Europe/Berlin");
@@ -2911,10 +3436,11 @@ mod tests {
         // The jitter half of the same invariant: a repo GET blip must not silently
         // drop an inherited window and re-pin the slot un-jittered.
         let pinned = PinnedSlot {
+            cron: None,
             timezone: Some("Europe/Berlin"),
             jitter: Some("30m"),
         };
-        let (eff, needs_recompute) = resolve_pinned_slot(pinned, &degraded_inherited());
+        let (eff, needs_recompute) = resolve_pinned_slot(CRON, pinned, &degraded_inherited());
         assert!(!needs_recompute, "degrade must never invalidate a live pin");
         assert_eq!(eff.tz.name(), "Europe/Berlin");
         assert_eq!(eff.jitter.as_deref(), Some("30m"));
@@ -2930,12 +3456,15 @@ mod tests {
     fn resolved_differing_zone_invalidates_established_pin() {
         // A genuine resolution to a different zone still recomputes (the pin is stale).
         let (eff, needs_recompute) =
-            resolve_pinned_slot(pinned_tz_only("UTC"), &resolved("Europe/Berlin"));
+            resolve_pinned_slot(CRON, pinned_tz_only("UTC"), &resolved("Europe/Berlin"));
         assert!(needs_recompute);
         assert_eq!(eff.tz.name(), "Europe/Berlin");
         // Same zone resolved → no churn.
-        let (_eff, again) =
-            resolve_pinned_slot(pinned_tz_only("Europe/Berlin"), &resolved("Europe/Berlin"));
+        let (_eff, again) = resolve_pinned_slot(
+            CRON,
+            pinned_tz_only("Europe/Berlin"),
+            &resolved("Europe/Berlin"),
+        );
         assert!(!again);
     }
 
@@ -2945,11 +3474,12 @@ mod tests {
         // 10m, the repository's `scheduleDefaults.jitter` is edited to 30m, the pin
         // is stale, and the value written back is the NEW window (not the old one).
         let pinned = PinnedSlot {
+            cron: None,
             timezone: Some("UTC"),
             jitter: Some("10m"),
         };
         let (eff, needs_recompute) =
-            resolve_pinned_slot(pinned, &resolved_with_jitter("UTC", Some("30m")));
+            resolve_pinned_slot(CRON, pinned, &resolved_with_jitter("UTC", Some("30m")));
         assert!(needs_recompute, "the inherited window changed");
         assert_eq!(eff.jitter.as_deref(), Some("30m"));
         assert_eq!(eff.window(), Some(StdDuration::from_secs(1800)));
@@ -2957,11 +3487,12 @@ mod tests {
 
         // ...and the re-pinned state is stable (no churn on the next pass).
         let repinned = PinnedSlot {
+            cron: None,
             timezone: Some("UTC"),
             jitter: Some("30m"),
         };
         let (_eff, again) =
-            resolve_pinned_slot(repinned, &resolved_with_jitter("UTC", Some("30m")));
+            resolve_pinned_slot(CRON, repinned, &resolved_with_jitter("UTC", Some("30m")));
         assert!(!again, "must stabilize after the one re-pin");
     }
 
@@ -2970,10 +3501,11 @@ mod tests {
         // Dropping `scheduleDefaults.jitter` must clear the recorded window, not
         // leave a stale one behind to invalidate every future pin forever.
         let pinned = PinnedSlot {
+            cron: None,
             timezone: Some("UTC"),
             jitter: Some("10m"),
         };
-        let (eff, needs_recompute) = resolve_pinned_slot(pinned, &resolved("UTC"));
+        let (eff, needs_recompute) = resolve_pinned_slot(CRON, pinned, &resolved("UTC"));
         assert!(needs_recompute);
         assert!(eff.jitter.is_none());
         assert_eq!(eff.window(), None);
@@ -2987,7 +3519,7 @@ mod tests {
     #[test]
     fn first_pin_degrade_then_recover_recomputes_exactly_once() {
         // (1) First reconcile while degraded: self-heal by pinning UTC now.
-        let eff0 = first_pin(&degraded_inherited());
+        let eff0 = first_pin(CRON, &degraded_inherited());
         assert_eq!(eff0.tz.name(), "UTC");
         assert!(eff0.ambiguity.is_none());
         assert!(eff0.jitter.is_none(), "degraded self-heal pins no jitter");
@@ -2996,7 +3528,7 @@ mod tests {
         // (2) Referents recover and resolve to the inherited Europe/Berlin: the
         // pinned-slot branch recomputes exactly once (UTC != Europe/Berlin).
         let (eff1, recompute1) =
-            resolve_pinned_slot(pinned_tz_only(&pinned_tz), &resolved("Europe/Berlin"));
+            resolve_pinned_slot(CRON, pinned_tz_only(&pinned_tz), &resolved("Europe/Berlin"));
         assert!(
             recompute1,
             "recovery must recompute the UTC self-heal pin once"
@@ -3006,7 +3538,7 @@ mod tests {
 
         // (3) Steady state: the same resolution no longer recomputes (stabilizes).
         let (_eff2, recompute2) =
-            resolve_pinned_slot(pinned_tz_only(&pinned_tz), &resolved("Europe/Berlin"));
+            resolve_pinned_slot(CRON, pinned_tz_only(&pinned_tz), &resolved("Europe/Berlin"));
         assert!(
             !recompute2,
             "must stabilize — no repeated churn after recovery"
@@ -3022,18 +3554,19 @@ mod tests {
         let chicago: Tz = "America/Chicago".parse().unwrap();
         let degraded = degraded_own(Some("America/Chicago"), None);
         // First pin: the user's zone, NOT the UTC self-heal.
-        let eff = first_pin(&degraded);
+        let eff = first_pin(CRON, &degraded);
         assert_eq!(eff.tz, chicago);
         assert!(eff.jitter.is_none(), "the inherited half is still unknown");
 
         // Established pin in the same zone: nothing changed, no churn.
-        let (eff, recompute) = resolve_pinned_slot(pinned_tz_only("America/Chicago"), &degraded);
+        let (eff, recompute) =
+            resolve_pinned_slot(CRON, pinned_tz_only("America/Chicago"), &degraded);
         assert_eq!(eff.tz, chicago);
         assert!(!recompute);
 
         // An explicit timezone EDIT still invalidates the pin while degraded —
         // exactly as it did before this half needed lookups at all.
-        let (eff, recompute) = resolve_pinned_slot(pinned_tz_only("UTC"), &degraded);
+        let (eff, recompute) = resolve_pinned_slot(CRON, pinned_tz_only("UTC"), &degraded);
         assert!(
             recompute,
             "an own-timezone edit must not wait on an unrelated referent"
@@ -3054,7 +3587,7 @@ mod tests {
     #[test]
     fn a_degraded_first_pin_keeps_an_explicitly_set_own_jitter() {
         let degraded = degraded_own(None, Some("10m"));
-        let eff = first_pin(&degraded);
+        let eff = first_pin(CRON, &degraded);
         assert_eq!(
             eff.jitter.as_deref(),
             Some("10m"),
@@ -3074,8 +3607,9 @@ mod tests {
     #[test]
     fn a_degraded_first_pin_with_own_jitter_recovers_without_churn() {
         // (1) Degraded first pin records the own window.
-        let eff0 = first_pin(&degraded_own(None, Some("10m")));
+        let eff0 = first_pin(CRON, &degraded_own(None, Some("10m")));
         let pinned = PinnedSlot {
+            cron: None,
             timezone: Some(eff0.tz.name()),
             jitter: eff0.jitter.as_deref(),
         };
@@ -3083,15 +3617,18 @@ mod tests {
         // (2) Referents recover. Own jitter still wins, so the resolved window is the
         // same one already pinned: the jitter half contributes NO recompute.
         let (eff1, recompute) =
-            resolve_pinned_slot(pinned, &resolved_with_jitter("UTC", Some("10m")));
+            resolve_pinned_slot(CRON, pinned, &resolved_with_jitter("UTC", Some("10m")));
         assert!(!recompute, "the pinned window already matches — no churn");
         assert_eq!(eff1.jitter.as_deref(), Some("10m"));
 
         // (3) And when the inherited TIMEZONE half also recovers to something else,
         // the one recompute it drives re-pins the window unchanged rather than
         // dropping it.
-        let (eff2, recompute) =
-            resolve_pinned_slot(pinned, &resolved_with_jitter("Europe/Berlin", Some("10m")));
+        let (eff2, recompute) = resolve_pinned_slot(
+            CRON,
+            pinned,
+            &resolved_with_jitter("Europe/Berlin", Some("10m")),
+        );
         assert!(recompute, "driven by the recovered timezone");
         assert_eq!(eff2.tz.name(), "Europe/Berlin");
         assert_eq!(eff2.jitter.as_deref(), Some("10m"));
@@ -3103,10 +3640,11 @@ mod tests {
         // degraded (it needed no lookup), and the re-pin records the NEW window.
         let degraded = degraded_own(None, Some("10m"));
         let pinned = PinnedSlot {
+            cron: None,
             timezone: Some("UTC"),
             jitter: Some("30m"),
         };
-        let (eff, recompute) = resolve_pinned_slot(pinned, &degraded);
+        let (eff, recompute) = resolve_pinned_slot(CRON, pinned, &degraded);
         assert!(
             recompute,
             "an own-jitter edit must not wait on an unrelated referent"
@@ -3114,10 +3652,11 @@ mod tests {
         assert_eq!(eff.jitter.as_deref(), Some("10m"));
         // Unchanged own jitter → no churn.
         let same = PinnedSlot {
+            cron: None,
             timezone: Some("UTC"),
             jitter: Some("10m"),
         };
-        let (_eff, recompute) = resolve_pinned_slot(same, &degraded);
+        let (_eff, recompute) = resolve_pinned_slot(CRON, same, &degraded);
         assert!(!recompute);
     }
 
@@ -3125,7 +3664,7 @@ mod tests {
     /// no longer self-heals to UTC because it was explicitly set.
     #[test]
     fn a_degraded_pass_keeps_both_explicitly_set_halves() {
-        let eff = first_pin(&degraded_own(Some("America/Chicago"), Some("10m")));
+        let eff = first_pin(CRON, &degraded_own(Some("America/Chicago"), Some("10m")));
         assert_eq!(eff.tz.name(), "America/Chicago");
         assert_eq!(eff.jitter.as_deref(), Some("10m"));
         let pin = eff.pin_json(at(2026, 5, 24, 2, 0));
@@ -3139,10 +3678,11 @@ mod tests {
         // carried through untouched — a degraded pass knows nothing about it.
         let degraded = degraded_own(Some("America/Chicago"), None);
         let pinned = PinnedSlot {
+            cron: None,
             timezone: Some("UTC"),
             jitter: Some("30m"),
         };
-        let (eff, recompute) = resolve_pinned_slot(pinned, &degraded);
+        let (eff, recompute) = resolve_pinned_slot(CRON, pinned, &degraded);
         assert!(recompute, "driven by the own-timezone change");
         assert_eq!(
             eff.jitter.as_deref(),
@@ -3150,7 +3690,7 @@ mod tests {
             "the re-pin must carry the pin's own window, not drop it to none"
         );
         // And with no own timezone there is nothing left to recompute at all.
-        let (eff, recompute) = resolve_pinned_slot(pinned, &degraded_inherited());
+        let (eff, recompute) = resolve_pinned_slot(CRON, pinned, &degraded_inherited());
         assert!(!recompute);
         assert_eq!(eff.jitter.as_deref(), Some("30m"));
         assert_eq!(eff.tz, Tz::UTC, "from the pin's own recorded zone");
@@ -3158,13 +3698,13 @@ mod tests {
 
     #[test]
     fn first_pin_resolved_pins_that_zone() {
-        let eff = first_pin(&resolved("America/Chicago"));
+        let eff = first_pin(CRON, &resolved("America/Chicago"));
         assert_eq!(eff.tz.name(), "America/Chicago");
     }
 
     #[test]
     fn first_pin_resolved_pins_the_inherited_jitter_window() {
-        let eff = first_pin(&resolved_with_jitter("America/Chicago", Some("15m")));
+        let eff = first_pin(CRON, &resolved_with_jitter("America/Chicago", Some("15m")));
         assert_eq!(eff.tz.name(), "America/Chicago");
         assert_eq!(eff.jitter.as_deref(), Some("15m"));
         assert_eq!(eff.window(), Some(StdDuration::from_secs(900)));
@@ -3188,7 +3728,7 @@ mod tests {
             ScheduleJitterResolution::Agreed(None)
         );
 
-        let eff = first_pin(&resolved_with_jitter("Europe/Berlin", None));
+        let eff = first_pin(CRON, &resolved_with_jitter("Europe/Berlin", None));
         // 1. No window reaches `next_fire`, so the slot is the bare cron instant.
         assert_eq!(eff.window(), None);
         let after = at(2026, 5, 24, 3, 0);
@@ -3214,7 +3754,9 @@ mod tests {
         assert_eq!(pin["jitter"], serde_json::Value::Null);
         // 3. And the pin never goes stale on its own.
         assert!(!pin_needs_recompute(
+            CRON,
             PinnedSlot {
+                cron: None,
                 timezone: Some("Europe/Berlin"),
                 jitter: None
             },
@@ -3243,7 +3785,7 @@ mod tests {
             ScheduleJitterResolution::Agreed(w) => w,
             ScheduleJitterResolution::Disagreed { .. } => None,
         };
-        let eff = first_pin(&resolved_with_jitter("UTC", window.as_deref()));
+        let eff = first_pin(CRON, &resolved_with_jitter("UTC", window.as_deref()));
         assert_eq!(eff.window(), None);
         let after = at(2026, 5, 24, 3, 0);
         assert_eq!(
@@ -4643,6 +5185,7 @@ mod tests {
         s.metadata.generation = Some(3);
         s.status = Some(kopiur_api::SnapshotScheduleStatus {
             next_schedule: Some(kopiur_api::snapshot_schedule::ScheduleRef {
+                cron: None,
                 at: Some(slot.to_rfc3339()),
                 timezone: Some("UTC".into()),
                 jitter: None,
@@ -5123,6 +5666,27 @@ mod tests {
         schedule: SnapshotSchedule,
         schedule_defaults: serde_json::Value,
     ) -> Option<serde_json::Value> {
+        reconcile_logged(schedule, schedule_defaults)
+            .await
+            .iter()
+            .find(|(line, _)| line.contains("/snapshotschedules/nightly/status"))
+            .and_then(|(_, body)| body.pointer("/status/nextSchedule").cloned())
+    }
+
+    /// The `/status` object of the schedule's status patch, if one was written.
+    fn status_patch(requests: &[(String, serde_json::Value)]) -> Option<serde_json::Value> {
+        requests
+            .iter()
+            .find(|(line, _)| line.contains("/snapshotschedules/nightly/status"))
+            .and_then(|(_, body)| body.pointer("/status").cloned())
+    }
+
+    /// [`reconcile_with_repo_defaults`], but returning every request it made
+    /// (method + path, and body), so a test can assert what was NOT written too.
+    async fn reconcile_logged(
+        schedule: SnapshotSchedule,
+        schedule_defaults: serde_json::Value,
+    ) -> Vec<(String, serde_json::Value)> {
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let client = body_recording_client(log.clone(), move |_method, path| {
             if path.contains("/snapshotpolicies/") {
@@ -5145,20 +5709,22 @@ mod tests {
         reconcile_inner(&schedule, &ctx)
             .await
             .expect("reconcile must succeed");
-        let requests = log.lock().unwrap().clone();
-        requests
-            .iter()
-            .find(|(line, _)| line.contains("/snapshotschedules/nightly/status"))
-            .and_then(|(_, body)| body.pointer("/status/nextSchedule").cloned())
+        log.lock().unwrap().clone()
     }
 
     /// A schedule pinned to a FUTURE slot, inheriting BOTH timing inputs (no own
     /// `timezone`/`jitter`), with `pinned_jitter` recorded on the pin.
+    ///
+    /// `observedGeneration` matches `metadata.generation`, so the not-due path has
+    /// no stale generation to catch up on: a test that asserts "no status patch"
+    /// is asserting the pin logic alone, not the #545 generation catch-up.
     fn inheriting_pinned_schedule(pinned_jitter: Option<&str>) -> SnapshotSchedule {
         let mut s = schedule_fixture("apps", "nightly", ConcurrencyPolicy::Forbid);
         s.metadata.generation = Some(3);
         s.status = Some(kopiur_api::SnapshotScheduleStatus {
+            observed_generation: Some(3),
             next_schedule: Some(kopiur_api::snapshot_schedule::ScheduleRef {
+                cron: None,
                 // Far enough out that the slot is never due while the test runs.
                 at: Some((Utc::now() + chrono::Duration::days(30)).to_rfc3339()),
                 timezone: Some("UTC".into()),
@@ -5230,15 +5796,132 @@ mod tests {
     /// window ⇒ no recompute, no status churn on every reconcile.
     #[tokio::test]
     async fn an_unchanged_inherited_jitter_window_is_patch_free() {
-        let pin = reconcile_with_repo_defaults(
+        let requests = reconcile_logged(
             inheriting_pinned_schedule(Some("30m")),
             serde_json::json!({ "jitter": "30m" }),
         )
         .await;
+        let patch = status_patch(&requests);
         assert!(
-            pin.is_none(),
-            "the steady state must not re-pin every reconcile, got {pin:?}"
+            patch.is_none(),
+            "the steady state must not write status at all, got {patch:?}"
         );
+    }
+
+    // --- #545: a cron edit must invalidate the pin --------------------------
+
+    #[test]
+    fn the_wait_path_patches_only_on_a_change_or_a_stale_generation() {
+        let mut s = inheriting_pinned_schedule(None);
+        let resolved = resolved("UTC");
+        let steady = WaitFacts::default();
+        assert!(
+            !wait_needs_status_patch(&s, &resolved, steady),
+            "steady state is patch-free"
+        );
+        // A spec edit bumped the generation: catch up.
+        s.metadata.generation = Some(4);
+        assert!(wait_needs_status_patch(&s, &resolved, steady));
+        // A degraded pass never writes, even with a stale generation.
+        assert!(!wait_needs_status_patch(&s, &degraded_inherited(), steady));
+        // A missing status is stale too (generation absent counts as 0).
+        s.status = None;
+        s.metadata.generation = None;
+        assert!(wait_needs_status_patch(&s, &resolved, steady));
+        // A condition change alone still patches.
+        let s = inheriting_pinned_schedule(None);
+        assert!(wait_needs_status_patch(
+            &s,
+            &resolved,
+            WaitFacts {
+                tz_ambiguous: true,
+                ..steady
+            }
+        ));
+        assert!(wait_needs_status_patch(
+            &s,
+            &resolved,
+            WaitFacts {
+                parked: true,
+                ..steady
+            }
+        ));
+    }
+
+    /// **#545, end to end.** The pin was computed from `0 3 * * *` and is DUE;
+    /// the user has since edited the cron to `0 4 * * *`. The old slot must not
+    /// fire: the reconcile re-pins from the new expression (recording it) and
+    /// mints no Snapshot. Pre-fix the stale slot fired one more time.
+    #[tokio::test]
+    async fn a_cron_edit_re_pins_next_schedule_without_firing_the_old_slot() {
+        let mut schedule = inheriting_pinned_schedule(None);
+        schedule.spec.schedule.cron = "0 4 * * *".into();
+        schedule.metadata.generation = Some(4);
+        let pin = schedule
+            .status
+            .as_mut()
+            .and_then(|s| s.next_schedule.as_mut())
+            .unwrap();
+        pin.at = Some((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339());
+        pin.cron = Some("0 3 * * *".into());
+
+        let requests = reconcile_logged(schedule, serde_json::json!({})).await;
+        let joined: Vec<&str> = requests.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(
+            !requests
+                .iter()
+                .any(|(l, _)| l.starts_with("PATCH ") && l.contains("/snapshots/")),
+            "the stale slot of the OLD cron must not fire: {joined:?}"
+        );
+        let status = status_patch(&requests).expect("the stale pin must be recomputed");
+        assert_eq!(status["nextSchedule"]["cron"], "0 4 * * *");
+        let at = status["nextSchedule"]["at"].as_str().expect("a new slot");
+        let at = DateTime::parse_from_rfc3339(at).unwrap();
+        assert_eq!(
+            at.format("%H:%M").to_string(),
+            "04:00",
+            "the new slot comes from the NEW expression"
+        );
+        assert_eq!(status["observedGeneration"], 4);
+    }
+
+    /// A legacy pin (no recorded cron) under a changed spec cron is left alone,
+    /// through the real reconcile: the not-due path must not re-pin it.
+    #[tokio::test]
+    async fn a_legacy_pin_with_no_recorded_cron_is_not_re_pinned() {
+        let mut schedule = inheriting_pinned_schedule(None);
+        schedule.spec.schedule.cron = "0 4 * * *".into();
+        let requests = reconcile_logged(schedule, serde_json::json!({})).await;
+        assert!(
+            status_patch(&requests).is_none(),
+            "an absent recorded cron is 'unchanged' (pruned-field safety)"
+        );
+    }
+
+    /// **#545, second half.** Any spec edit bumps `metadata.generation`; the
+    /// not-due path must catch `status.observedGeneration` (and Ready's) up, or a
+    /// `suspend: true` toggle keeps reporting `Ready=True/Scheduled` until the
+    /// next fire. Pre-fix the not-due path wrote nothing here.
+    #[tokio::test]
+    async fn a_spec_edit_catches_observed_generation_up_on_the_wait_path() {
+        let mut schedule = inheriting_pinned_schedule(None);
+        schedule.metadata.generation = Some(4);
+        schedule.spec.schedule.suspend = true;
+        let requests = reconcile_logged(schedule, serde_json::json!({})).await;
+        let status = status_patch(&requests).expect("a stale observedGeneration must be patched");
+        assert_eq!(status["observedGeneration"], 4);
+        assert!(
+            status.get("nextSchedule").is_none(),
+            "catching the generation up must not move the pin: {status}"
+        );
+        let ready = status["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "Ready")
+            .expect("Ready condition");
+        assert_eq!(ready["reason"], "Suspended");
+        assert_eq!(ready["observedGeneration"], 4);
     }
 
     /// A repository GET failure (`Degraded`) must keep BOTH pinned timing inputs —
@@ -5277,5 +5960,591 @@ mod tests {
             repinned.is_none(),
             "a transient referent failure must never move an established pin, got {repinned:?}"
         );
+    }
+
+    // --- #584: runs this schedule did not start hold Forbid/Replace ----------
+
+    /// An unfinished run in `apps` naming `policy` through its typed
+    /// `spec.policyRef` — the shape `kubectl kopiur snapshot now` mints (origin
+    /// label `manual`, no schedule label).
+    fn manual_run(name: &str, policy: &str, phase: Option<SnapshotPhase>) -> Snapshot {
+        let mut s = run_in_phase(name, phase, false);
+        s.metadata.namespace = Some("apps".into());
+        s.metadata.labels = Some(BTreeMap::from([(
+            ORIGIN_LABEL.to_string(),
+            "manual".to_string(),
+        )]));
+        s.spec.policy_ref = Some(PolicyRef {
+            name: policy.into(),
+            namespace: None,
+        });
+        s
+    }
+
+    fn pg_target() -> Vec<PolicyRef> {
+        vec![PolicyRef {
+            name: "pg".into(),
+            namespace: None,
+        }]
+    }
+
+    #[test]
+    fn a_manual_run_of_the_target_policy_blocks_the_slot() {
+        let rows = [manual_run(
+            "pg-manual-1",
+            "pg",
+            Some(SnapshotPhase::Running),
+        )];
+        let blockers = slot_blockers(&rows, &[], "apps", &pg_target());
+        assert_eq!(blockers, vec![ActiveRun::Foreign("pg-manual-1".into())]);
+        assert_eq!(first_foreign_run(&blockers).as_deref(), Some("pg-manual-1"));
+    }
+
+    /// A foreign run that is not moving data must never hold the slot: a manual
+    /// Snapshot stuck `Pending` forever (no privileged opt-in, missing repository)
+    /// would otherwise silence the schedule indefinitely. Failing open here only
+    /// risks the pre-#584 overlap, never data loss.
+    #[test]
+    fn a_foreign_run_that_is_not_running_does_not_block() {
+        for phase in [None, Some(SnapshotPhase::Pending)] {
+            let rows = [manual_run("stuck", "pg", phase.clone())];
+            assert!(
+                slot_blockers(&rows, &[], "apps", &pg_target()).is_empty(),
+                "a {phase:?} foreign run must not hold the slot"
+            );
+        }
+    }
+
+    /// An unreadable phase on a FOREIGN run is someone else's run (likely a newer
+    /// operator's): it must not wedge this schedule.
+    #[test]
+    fn an_unknown_phase_foreign_run_does_not_block() {
+        let rows = [manual_run(
+            "newer",
+            "pg",
+            Some(SnapshotPhase::Unknown("Copying".into())),
+        )];
+        assert!(slot_blockers(&rows, &[], "apps", &pg_target()).is_empty());
+    }
+
+    /// Own runs keep the concurrency gate's unfinished set, `Unknown` included
+    /// (fail closed — that gate is `BlockedOnUnreadable`).
+    #[test]
+    fn own_runs_keep_the_unfinished_set() {
+        for phase in [
+            None,
+            Some(SnapshotPhase::Pending),
+            Some(SnapshotPhase::Running),
+            Some(SnapshotPhase::Unknown("Copying".into())),
+        ] {
+            let own = manual_run("nightly-1", "pg", phase.clone());
+            assert_eq!(
+                slot_blockers(
+                    std::slice::from_ref(&own),
+                    std::slice::from_ref(&own),
+                    "apps",
+                    &pg_target()
+                ),
+                vec![ActiveRun::Own("nightly-1".into())],
+                "{phase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_of_a_different_policy_does_not_block() {
+        let rows = [manual_run("other", "redis", Some(SnapshotPhase::Running))];
+        assert!(slot_blockers(&rows, &[], "apps", &pg_target()).is_empty());
+        // A row with no policyRef (a discovered catalog row) never matches.
+        let mut discovered = manual_run("disc", "pg", Some(SnapshotPhase::Running));
+        discovered.spec.policy_ref = None;
+        assert!(slot_blockers(&[discovered], &[], "apps", &pg_target()).is_empty());
+    }
+
+    #[test]
+    fn the_policy_match_is_the_typed_ref_not_the_labels() {
+        // Labels claim `pg`, the typed ref says `redis`: not a blocker.
+        let mut lying = manual_run("lying", "redis", Some(SnapshotPhase::Running));
+        lying
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(kopiur_api::consts::CONFIG_LABEL.to_string(), "pg".into());
+        assert!(slot_blockers(&[lying], &[], "apps", &pg_target()).is_empty());
+    }
+
+    #[test]
+    fn finished_or_terminating_runs_do_not_block() {
+        for phase in [
+            SnapshotPhase::Succeeded,
+            SnapshotPhase::Failed,
+            SnapshotPhase::Deleting,
+            SnapshotPhase::Discovered,
+            SnapshotPhase::Unchanged,
+        ] {
+            let rows = [manual_run("done", "pg", Some(phase.clone()))];
+            assert!(
+                slot_blockers(&rows, &[], "apps", &pg_target()).is_empty(),
+                "{phase:?} must not block"
+            );
+        }
+        let mut leaving = manual_run("leaving", "pg", Some(SnapshotPhase::Running));
+        leaving.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+            ));
+        assert!(slot_blockers(&[leaving], &[], "apps", &pg_target()).is_empty());
+    }
+
+    #[test]
+    fn slot_blockers_scope_to_the_namespace_and_resolve_ref_namespaces() {
+        // Same policy name in another namespace: not ours.
+        let mut elsewhere = manual_run("x", "pg", Some(SnapshotPhase::Running));
+        elsewhere.metadata.namespace = Some("other".into());
+        assert!(slot_blockers(&[elsewhere], &[], "apps", &pg_target()).is_empty());
+        // An explicit ref namespace equal to the default resolves the same.
+        let mut explicit = manual_run("y", "pg", Some(SnapshotPhase::Running));
+        explicit.spec.policy_ref.as_mut().unwrap().namespace = Some("apps".into());
+        assert_eq!(
+            slot_blockers(&[explicit], &[], "apps", &pg_target()),
+            vec![ActiveRun::Foreign("y".into())]
+        );
+        // A ref to `pg` in ANOTHER namespace is a different policy.
+        let mut cross = manual_run("z", "pg", Some(SnapshotPhase::Running));
+        cross.spec.policy_ref.as_mut().unwrap().namespace = Some("db".into());
+        assert!(slot_blockers(&[cross], &[], "apps", &pg_target()).is_empty());
+    }
+
+    #[test]
+    fn own_runs_are_classified_own_and_never_reported_as_foreign() {
+        let mut own = manual_run("nightly-20260804030000", "pg", Some(SnapshotPhase::Running));
+        own.metadata.labels = Some(BTreeMap::from([(
+            crate::consts::SCHEDULE_LABEL.to_string(),
+            "nightly".to_string(),
+        )]));
+        let manual = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+        let blockers = slot_blockers(
+            &[own.clone(), manual.clone()],
+            std::slice::from_ref(&own),
+            "apps",
+            &pg_target(),
+        );
+        assert_eq!(
+            blockers,
+            vec![
+                ActiveRun::Own("nightly-20260804030000".into()),
+                ActiveRun::Foreign("pg-manual-1".into()),
+            ]
+        );
+        assert_eq!(first_foreign_run(&blockers).as_deref(), Some("pg-manual-1"));
+        // Own runs alone: no foreign hold (the own gate handles them).
+        let only_own = slot_blockers(
+            std::slice::from_ref(&own),
+            std::slice::from_ref(&own),
+            "apps",
+            &pg_target(),
+        );
+        assert_eq!(first_foreign_run(&only_own), None);
+    }
+
+    #[test]
+    fn only_a_firing_forbid_or_replace_slot_checks_for_other_runs() {
+        use ConcurrencyPolicy::{Allow, Forbid, Replace};
+        use SlotDisposition::{Fire, SkipExpired, Wait};
+        for policy in [Forbid, Replace] {
+            assert!(needs_other_run_check(policy, Fire), "{policy:?}");
+            assert!(!needs_other_run_check(policy, Wait), "{policy:?}");
+            assert!(!needs_other_run_check(policy, SkipExpired), "{policy:?}");
+        }
+        for d in [Fire, Wait, SkipExpired] {
+            assert!(!needs_other_run_check(Allow, d), "Allow is unchanged");
+        }
+    }
+
+    #[test]
+    fn the_other_run_hold_is_set_and_cleared_from_the_same_fact() {
+        let schedule = schedule_fixture("apps", "nightly", ConcurrencyPolicy::Forbid);
+        let find = |conds: &serde_json::Value| {
+            conds
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["type"] == "HeldByOtherRun")
+                .cloned()
+                .unwrap()
+        };
+        let (held, _) = schedule_ready_status(
+            &schedule,
+            None,
+            Some(ScheduleHold::OtherRun("pg-manual-1")),
+            None,
+        );
+        let c = find(&held);
+        assert_eq!(c["status"], "True");
+        assert_eq!(c["reason"], "OtherRunActive");
+        let msg = c["message"].as_str().unwrap();
+        assert_eq!(
+            msg,
+            "Waiting for Snapshot apps/pg-manual-1 (a manual or other run of this policy) \
+             to finish."
+        );
+        let (clear, _) = schedule_ready_status(&schedule, None, None, None);
+        assert_eq!(find(&clear)["status"], "False");
+    }
+
+    /// Drive `reconcile_inner` for `schedule` (pinned to a DUE slot) with the
+    /// Snapshot store primed with `rows`. Snapshot reads/applies answer with a
+    /// real `Snapshot` so a fire can complete; returns every request made.
+    async fn reconcile_with_rows(
+        schedule: SnapshotSchedule,
+        rows: Vec<Snapshot>,
+    ) -> Vec<(String, serde_json::Value)> {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = body_recording_client(log.clone(), |method, path| {
+            if path.contains("/snapshotpolicies/") {
+                return (StatusCode::OK, policy_body("apps", "pg"));
+            }
+            if path.contains("/repositories/") {
+                return (
+                    StatusCode::OK,
+                    repository_body("apps", "repo", serde_json::json!({})),
+                );
+            }
+            if path.contains("/snapshotschedules/") {
+                return (StatusCode::OK, schedule_body("apps", "nightly"));
+            }
+            if method != http::Method::DELETE && path.contains("/snapshots/") {
+                return (StatusCode::OK, live_snapshot_body("apps", "run"));
+            }
+            (StatusCode::OK, ok_status())
+        });
+        let ctx = Context::test_context(client);
+        prime_snapshot_store(&ctx, rows, true);
+        reconcile_inner(&schedule, &ctx)
+            .await
+            .expect("reconcile must succeed");
+        log.lock().unwrap().clone()
+    }
+
+    /// A schedule under `policy` whose pinned slot is DUE.
+    fn due_schedule(policy: ConcurrencyPolicy) -> SnapshotSchedule {
+        let mut s = inheriting_pinned_schedule(None);
+        s.spec.schedule.concurrency_policy = policy;
+        s.status
+            .as_mut()
+            .and_then(|st| st.next_schedule.as_mut())
+            .unwrap()
+            .at = Some((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339());
+        s
+    }
+
+    fn mints(requests: &[(String, serde_json::Value)]) -> Vec<&str> {
+        requests
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .filter(|l| l.starts_with("PATCH ") && l.contains("/snapshots/"))
+            .collect()
+    }
+
+    /// **#584, end to end.** A `Forbid` schedule's slot comes due while a manual
+    /// `snapshot now` of the same policy is still running. Pre-fix the gate only
+    /// looked at the schedule's own children and fired beside it. Now the slot
+    /// is held, the condition names the blocking Snapshot, and one Normal event
+    /// says why.
+    #[tokio::test]
+    async fn forbid_holds_a_due_slot_behind_a_manual_run_of_the_same_policy() {
+        let manual = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+        let requests =
+            reconcile_with_rows(due_schedule(ConcurrencyPolicy::Forbid), vec![manual]).await;
+        assert!(
+            mints(&requests).is_empty(),
+            "Forbid must not fire beside a manual run: {:?}",
+            mints(&requests)
+        );
+        let status = status_patch(&requests).expect("entering the hold writes status");
+        assert!(
+            status.get("nextSchedule").is_none(),
+            "the pin is kept: {status}"
+        );
+        let held = status["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "HeldByOtherRun")
+            .expect("HeldByOtherRun condition");
+        assert_eq!(held["status"], "True");
+        assert!(
+            held["message"]
+                .as_str()
+                .unwrap()
+                .contains("Snapshot apps/pg-manual-1")
+        );
+        assert!(
+            requests.iter().any(|(l, _)| l.contains("/events")),
+            "a Normal event says why the slot is held"
+        );
+    }
+
+    /// A brand-new schedule (no `nextSchedule` pin yet) with `runOnCreate`.
+    fn fresh_run_on_create_schedule(policy: ConcurrencyPolicy) -> SnapshotSchedule {
+        let mut s = inheriting_pinned_schedule(None);
+        s.spec.schedule.concurrency_policy = policy;
+        s.spec.schedule.run_on_create = true;
+        s.status = None;
+        s
+    }
+
+    /// #584 (PR review): the `runOnCreate` first fire must honour `Forbid` too. A
+    /// fresh schedule created while a manual run of its policy is `Running` holds
+    /// instead of starting a second mover, records `HeldByOtherRun`, and does NOT
+    /// pin — so the creation run still happens once the manual run finishes.
+    #[tokio::test]
+    async fn run_on_create_holds_behind_a_running_manual_run_of_the_same_policy() {
+        for policy in [ConcurrencyPolicy::Forbid, ConcurrencyPolicy::Replace] {
+            let manual = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+            let requests =
+                reconcile_with_rows(fresh_run_on_create_schedule(policy), vec![manual]).await;
+            assert!(
+                mints(&requests).is_empty(),
+                "{policy:?}: runOnCreate must not fire beside a manual run: {:?}",
+                mints(&requests)
+            );
+            let lines: Vec<&str> = requests.iter().map(|(l, _)| l.as_str()).collect();
+            assert!(
+                !lines.iter().any(|l| l.starts_with("DELETE ")),
+                "{policy:?}: never cancels a run it does not own: {lines:?}"
+            );
+            let status = status_patch(&requests).expect("entering the hold writes status");
+            assert!(
+                status.get("nextSchedule").is_none() && status.get("lastSchedule").is_none(),
+                "{policy:?}: no pin and no lastSchedule, so the creation run fires later: {status}"
+            );
+            let held = status["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["type"] == "HeldByOtherRun")
+                .expect("HeldByOtherRun condition");
+            assert_eq!(held["status"], "True");
+            assert!(lines.iter().any(|l| l.contains("/events")), "{lines:?}");
+        }
+    }
+
+    /// Already holding: the recorded `HeldByOtherRun` and a current generation make
+    /// the 15s re-check a no-op — no status write and no repeated event.
+    #[tokio::test]
+    async fn a_recorded_run_on_create_hold_is_patch_and_event_free() {
+        let manual = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+        let first = reconcile_with_rows(
+            fresh_run_on_create_schedule(ConcurrencyPolicy::Forbid),
+            vec![manual.clone()],
+        )
+        .await;
+        let recorded = status_patch(&first).expect("the hold is recorded");
+        let mut held = fresh_run_on_create_schedule(ConcurrencyPolicy::Forbid);
+        held.status = Some(serde_json::from_value(recorded).expect("the recorded status decodes"));
+        let again = reconcile_with_rows(held, vec![manual]).await;
+        let lines: Vec<&str> = again.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(mints(&again).is_empty(), "{lines:?}");
+        assert!(status_patch(&again).is_none(), "no status write: {lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("/events")),
+            "no repeat event: {lines:?}"
+        );
+    }
+
+    /// The runOnCreate hold is policy-gated and run-gated like a pinned slot's:
+    /// `Allow` fires beside the manual run, and with no foreign run every policy
+    /// fires its creation run.
+    #[tokio::test]
+    async fn run_on_create_fires_under_allow_or_with_no_running_foreign_run() {
+        let manual = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+        let requests = reconcile_with_rows(
+            fresh_run_on_create_schedule(ConcurrencyPolicy::Allow),
+            vec![manual],
+        )
+        .await;
+        assert_eq!(mints(&requests).len(), 1, "{:?}", mints(&requests));
+        let pending = manual_run("pg-manual-2", "pg", Some(SnapshotPhase::Pending));
+        let requests = reconcile_with_rows(
+            fresh_run_on_create_schedule(ConcurrencyPolicy::Forbid),
+            vec![pending],
+        )
+        .await;
+        assert_eq!(
+            mints(&requests).len(),
+            1,
+            "a Pending foreign run does not hold: {:?}",
+            mints(&requests)
+        );
+    }
+
+    /// The hold is about the SAME policy: a manual run of another policy does
+    /// not hold the slot, which fires normally.
+    #[tokio::test]
+    async fn forbid_fires_beside_a_manual_run_of_a_different_policy() {
+        let other = manual_run("redis-manual-1", "redis", Some(SnapshotPhase::Running));
+        let requests =
+            reconcile_with_rows(due_schedule(ConcurrencyPolicy::Forbid), vec![other]).await;
+        assert_eq!(mints(&requests).len(), 1, "{:?}", mints(&requests));
+    }
+
+    /// `Replace` never cancels a run it does not own. With its own prior run AND
+    /// a manual run in flight, it deletes nothing and fires nothing: the whole
+    /// slot waits for the manual run, then replaces its own run as usual.
+    #[tokio::test]
+    async fn replace_holds_behind_a_foreign_run_and_deletes_nothing() {
+        let mut own = run_in_phase("nightly-prior", Some(SnapshotPhase::Running), false);
+        own.metadata.namespace = Some("apps".into());
+        own.metadata.labels = Some(BTreeMap::from([(
+            crate::consts::SCHEDULE_LABEL.to_string(),
+            "nightly".to_string(),
+        )]));
+        own.spec.policy_ref = Some(PolicyRef {
+            name: "pg".into(),
+            namespace: None,
+        });
+        let manual = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+        for rows in [vec![manual.clone()], vec![own, manual]] {
+            let requests =
+                reconcile_with_rows(due_schedule(ConcurrencyPolicy::Replace), rows).await;
+            let lines: Vec<&str> = requests.iter().map(|(l, _)| l.as_str()).collect();
+            assert!(
+                !lines.iter().any(|l| l.starts_with("DELETE ")),
+                "Replace must never cancel anything while a foreign run holds: {lines:?}"
+            );
+            assert!(mints(&requests).is_empty(), "{lines:?}");
+            let status = status_patch(&requests).expect("the hold is recorded");
+            let held = status["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["type"] == "HeldByOtherRun")
+                .unwrap()
+                .clone();
+            assert_eq!(held["status"], "True");
+        }
+    }
+
+    /// The hold is transition-gated and self-clearing: while it is already
+    /// recorded, a still-running manual run raises no second event; once the
+    /// manual run finishes, the held slot fires and the condition clears.
+    #[tokio::test]
+    async fn the_other_run_hold_events_once_and_clears_when_the_run_finishes() {
+        let held = |mut s: SnapshotSchedule| {
+            let (conds, _) =
+                schedule_ready_status(&s, None, Some(ScheduleHold::OtherRun("pg-manual-1")), None);
+            s.status.as_mut().unwrap().conditions = serde_json::from_value(conds).unwrap();
+            s
+        };
+        let schedule = held(due_schedule(ConcurrencyPolicy::Forbid));
+        let running = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+        let requests = reconcile_with_rows(schedule.clone(), vec![running]).await;
+        assert!(mints(&requests).is_empty());
+        assert!(
+            !requests.iter().any(|(l, _)| l.contains("/events")),
+            "an already-recorded hold must not re-event every requeue"
+        );
+
+        let done = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Succeeded));
+        let requests = reconcile_with_rows(schedule, vec![done]).await;
+        assert_eq!(
+            mints(&requests).len(),
+            1,
+            "the held slot fires once it is free"
+        );
+        let status = status_patch(&requests).unwrap();
+        let cond = status["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "HeldByOtherRun")
+            .unwrap()
+            .clone();
+        assert_eq!(cond["status"], "False");
+    }
+
+    /// Drive `reconcile_inner` `passes` times for `schedule` with the repository
+    /// unreadable, so every pass resolves `Degraded`. Returns every request made.
+    async fn degraded_passes(
+        schedule: SnapshotSchedule,
+        rows: Vec<Snapshot>,
+        passes: usize,
+    ) -> Vec<(String, serde_json::Value)> {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = body_recording_client(log.clone(), |method, path| {
+            if path.contains("/snapshotpolicies/") {
+                return (StatusCode::OK, policy_body("apps", "pg"));
+            }
+            if path.contains("/repositories/") {
+                return (StatusCode::INTERNAL_SERVER_ERROR, ok_status());
+            }
+            if path.contains("/snapshotschedules/") {
+                return (StatusCode::OK, schedule_body("apps", "nightly"));
+            }
+            if method != http::Method::DELETE && path.contains("/snapshots/") {
+                return (StatusCode::OK, live_snapshot_body("apps", "run"));
+            }
+            (StatusCode::OK, ok_status())
+        });
+        let ctx = Context::test_context(client);
+        prime_snapshot_store(&ctx, rows, true);
+        for _ in 0..passes {
+            reconcile_inner(&schedule, &ctx)
+                .await
+                .expect("a degraded pass must not fail the reconcile");
+        }
+        log.lock().unwrap().clone()
+    }
+
+    /// A `Degraded` pass writes no status, so it must not emit the hold event
+    /// either: the event is gated on the recorded condition, and an unrecorded one
+    /// would re-event every 15s requeue for as long as the referent is unreadable.
+    #[tokio::test]
+    async fn a_degraded_pass_neither_records_nor_events_the_other_run_hold() {
+        let manual = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+        let requests =
+            degraded_passes(due_schedule(ConcurrencyPolicy::Forbid), vec![manual], 3).await;
+        let lines: Vec<&str> = requests.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(mints(&requests).is_empty(), "{lines:?}");
+        assert!(status_patch(&requests).is_none(), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("/events")),
+            "no hold event on a degraded pass: {lines:?}"
+        );
+    }
+
+    /// Same guard for `Replace` held behind its own parked run (1s requeue).
+    #[tokio::test]
+    async fn a_degraded_pass_neither_records_nor_events_the_parked_run_hold() {
+        let mut own = parked_run("nightly-prior", Some(SnapshotPhase::Pending));
+        own.metadata.namespace = Some("apps".into());
+        own.metadata.labels = Some(BTreeMap::from([(
+            crate::consts::SCHEDULE_LABEL.to_string(),
+            "nightly".to_string(),
+        )]));
+        own.spec.policy_ref = Some(PolicyRef {
+            name: "pg".into(),
+            namespace: None,
+        });
+        let requests =
+            degraded_passes(due_schedule(ConcurrencyPolicy::Replace), vec![own], 3).await;
+        let lines: Vec<&str> = requests.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(mints(&requests).is_empty(), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.starts_with("DELETE ")), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("/events")),
+            "no hold event on a degraded pass: {lines:?}"
+        );
+    }
+
+    /// `Allow` is unchanged: it runs beside anything.
+    #[tokio::test]
+    async fn allow_still_fires_beside_a_manual_run() {
+        let manual = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+        let requests =
+            reconcile_with_rows(due_schedule(ConcurrencyPolicy::Allow), vec![manual]).await;
+        assert_eq!(mints(&requests).len(), 1, "{:?}", mints(&requests));
     }
 }

@@ -29,7 +29,12 @@ pub struct MoverSpec {
     /// combinable with `inheritSecurityContextFrom`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_security_context: Option<k8s_openapi::api::core::v1::PodSecurityContext>,
-    /// Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+    /// Opt-in, namespace-gated privileged mode. Never changes the UID. When the mover runs
+    /// as root (`runAsUser: 0`), adds the capabilities the operation needs on top of
+    /// `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
+    /// `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
+    /// ownership). Grants nothing for maintenance, or when the mover does not run as
+    /// root (capabilities are inert for non-root); set `runAsUser: 0` yourself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub privileged_mode: Option<bool>,
     /// Copy the UID/GID security context from a live workload rather than hard-coding it.
@@ -65,6 +70,46 @@ impl MoverSpec {
             self.pod_security_context.as_ref(),
             self.privileged_mode,
         )
+    }
+
+    /// Admission-time warning when `privilegedMode: true` would certainly grant nothing:
+    /// this spec pins a non-zero `runAsUser` (capabilities are inert for non-root, and
+    /// `privilegedMode` never picks a UID).
+    ///
+    /// Judged on `hardened ⊂ self` only. A spec with no `runAsUser` stays silent: the
+    /// repository's `moverDefaults` may pin `runAsUser: 0` and is invisible here, so
+    /// warning would be a false positive. The controller's `PrivilegedModeInert` Event,
+    /// which sees the merged context, reports that case. An `inheritSecurityContextFrom`
+    /// identity resolves at reconcile time, so it stays silent too.
+    pub fn privileged_mode_warning(&self, op: MoverOperation) -> Option<String> {
+        if self.inherit_security_context_from.is_some() {
+            return None;
+        }
+        let resolved = resolve_mover(
+            None,
+            self.security_context.as_ref(),
+            self.pod_security_context.as_ref(),
+            None,
+            None,
+            None,
+        );
+        let effect = privileged_mode_effect(
+            &resolved.security_context,
+            resolved.pod_security_context.as_ref(),
+            self.privileged_mode,
+            op,
+        );
+        match effect {
+            // A non-root uid pinned on this object stays non-root whatever the
+            // repository's moverDefaults say, so it is certainly inert.
+            PrivilegedModeEffect::InertNonRootUid { .. } => effect.warning(),
+            // No uid here: moverDefaults (invisible at admission) may pin root. Leave
+            // it to the controller's PrivilegedModeInert Event, which sees the merge.
+            PrivilegedModeEffect::InertUnsetUid
+            | PrivilegedModeEffect::NotRequested
+            | PrivilegedModeEffect::NothingToGrant
+            | PrivilegedModeEffect::Granted => None,
+        }
     }
 
     /// Overlay `self` — the **HIGHER** layer — onto `base`, field by field, producing
@@ -267,6 +312,7 @@ pub struct Throttle {
 /// `Some` only when some layer set them. The privileged-mover gate (§4.11/§G16) runs on
 /// `security_context`/`pod_security_context` *here* — the merged result — not on the raw
 /// recipe, so an elevation introduced by `moverDefaults` is still gated.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedMover {
     /// Merged container security context — always present (hardened base).
     pub security_context: SecurityContext,
@@ -385,6 +431,42 @@ pub fn resolve_mover(
         throttle: defaults.and_then(|d| d.throttle.clone()),
         pod_labels: defaults.and_then(|d| d.pod_labels.clone()),
         pod_annotations: defaults.and_then(|d| d.pod_annotations.clone()),
+    }
+}
+
+impl ResolvedMover {
+    /// Apply `privilegedMode` for `op` to this resolved mover (#552): a root mover gets the
+    /// operation's capabilities added on top of `drop: [ALL]`; the UID is never changed.
+    /// See [`apply_privileged_mode`] for the contract. Re-runs the (idempotent)
+    /// security-context invariants afterwards. A no-op unless `privileged_mode ==
+    /// Some(true)` and the effective UID is `0`.
+    pub fn with_privileged_mode(self, privileged_mode: Option<bool>, op: MoverOperation) -> Self {
+        self.with_privileged_mode_effect(privileged_mode, op).0
+    }
+
+    /// [`Self::with_privileged_mode`], also returning what was done, so a caller can
+    /// surface an inert grant ([`PrivilegedModeEffect::warning`]) to the user.
+    pub fn with_privileged_mode_effect(
+        self,
+        privileged_mode: Option<bool>,
+        op: MoverOperation,
+    ) -> (Self, PrivilegedModeEffect) {
+        let (sc, psc, effect) = apply_privileged_mode(
+            self.security_context,
+            self.pod_security_context,
+            privileged_mode,
+            op,
+        );
+        let (security_context, pod_security_context) =
+            crate::invariants::enforce_security_context_invariants(sc, psc);
+        (
+            Self {
+                security_context,
+                pod_security_context,
+                ..self
+            },
+            effect,
+        )
     }
 }
 

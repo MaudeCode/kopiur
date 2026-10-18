@@ -4,6 +4,7 @@ import { type ReactNode, useEffect, useState } from "react";
 import { ColumnHeader } from "./ColumnHeader";
 import { ColumnPicker } from "./ColumnPicker";
 import { useColumnPrefs } from "./columnPrefs";
+import { ROW_LINK_ROW, followRowLink } from "./rowLink";
 import {
   type ColumnSpec,
   type SortValue,
@@ -17,8 +18,13 @@ import {
   visibleColumns,
 } from "./tableColumns";
 
-/** Attributes a row may carry: its kind for the stripe, a state for styling. */
-type RowAttributes = Record<`data-${string}`, string | undefined>;
+/**
+ * Attributes a row may carry: its kind for the stripe, a state for styling, and
+ * its own classes (merged with the whole-row link class, never replaced by it).
+ */
+type RowAttributes = Record<`data-${string}`, string | undefined> & {
+  className?: string | undefined;
+};
 
 export interface ColumnLedgerProps<Row, Id extends string> {
   /** Names the table's stored layout; stable across releases. */
@@ -31,6 +37,12 @@ export interface ColumnLedgerProps<Row, Id extends string> {
   rows: readonly Row[];
   rowKey: (row: Row) => string;
   rowProps?: ((row: Row) => RowAttributes) | undefined;
+  /**
+   * Every row carries an `a.row-link` to its object, and a click anywhere
+   * else in the row follows it (`rowLink.ts`). Required wherever a cell
+   * renders a `row-link` — the stylesheet no longer stretches the link.
+   */
+  rowLinks?: boolean | undefined;
   /** One cell's content. A `switch` over `Id`, so a new column cannot go undrawn. */
   cell: (row: Row, id: Id) => ReactNode;
   /**
@@ -69,6 +81,7 @@ export function ColumnLedger<Row, Id extends string>({
   rows,
   rowKey,
   rowProps,
+  rowLinks = false,
   cell,
   sortValue,
   serverSorted = false,
@@ -129,15 +142,26 @@ export function ColumnLedger<Row, Id extends string>({
             </tr>
           </thead>
           <tbody>
-            {shown.map((row) => (
-              <tr key={rowKey(row)} {...rowProps?.(row)}>
-                {visible.map((spec) => (
-                  <td key={spec.id} className={cellClass(spec)}>
-                    {cell(row, spec.id)}
-                  </td>
-                ))}
-              </tr>
-            ))}
+            {shown.map((row) => {
+              const props = rowProps?.(row);
+              const className =
+                [props?.className, rowLinks ? ROW_LINK_ROW : null].filter(Boolean).join(" ") ||
+                undefined;
+              return (
+                <tr
+                  key={rowKey(row)}
+                  {...props}
+                  className={className}
+                  {...(rowLinks ? { onClick: followRowLink, onAuxClick: followRowLink } : {})}
+                >
+                  {visible.map((spec) => (
+                    <td key={spec.id} className={cellClass(spec)}>
+                      {cell(row, spec.id)}
+                    </td>
+                  ))}
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>

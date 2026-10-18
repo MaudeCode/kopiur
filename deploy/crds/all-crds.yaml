@@ -1134,7 +1134,13 @@ spec:
                             type: object
                         type: object
                       privilegedMode:
-                        description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+                        description: |-
+                          Opt-in, namespace-gated privileged mode. Never changes the UID. When the mover runs
+                          as root (`runAsUser: 0`), adds the capabilities the operation needs on top of
+                          `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
+                          `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
+                          ownership). Grants nothing for maintenance, or when the mover does not run as
+                          root (capabilities are inert for non-root); set `runAsUser: 0` yourself.
                         nullable: true
                         type: boolean
                       resources:
@@ -5402,7 +5408,13 @@ spec:
                             type: object
                         type: object
                       privilegedMode:
-                        description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+                        description: |-
+                          Opt-in, namespace-gated privileged mode. Never changes the UID. When the mover runs
+                          as root (`runAsUser: 0`), adds the capabilities the operation needs on top of
+                          `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
+                          `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
+                          ownership). Grants nothing for maintenance, or when the mover does not run as
+                          root (capabilities are inert for non-root); set `runAsUser: 0` yourself.
                         nullable: true
                         type: boolean
                       resources:
@@ -9187,7 +9199,13 @@ spec:
                         type: object
                     type: object
                   privilegedMode:
-                    description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+                    description: |-
+                      Opt-in, namespace-gated privileged mode. Never changes the UID. When the mover runs
+                      as root (`runAsUser: 0`), adds the capabilities the operation needs on top of
+                      `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
+                      `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
+                      ownership). Grants nothing for maintenance, or when the mover does not run as
+                      root (capabilities are inert for non-root); set `runAsUser: 0` yourself.
                     nullable: true
                     type: boolean
                   resources:
@@ -10699,7 +10717,13 @@ spec:
                         type: object
                     type: object
                   privilegedMode:
-                    description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+                    description: |-
+                      Opt-in, namespace-gated privileged mode. Never changes the UID. When the mover runs
+                      as root (`runAsUser: 0`), adds the capabilities the operation needs on top of
+                      `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
+                      `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
+                      ownership). Grants nothing for maintenance, or when the mover does not run as
+                      root (capabilities are inert for non-root); set `runAsUser: 0` yourself.
                     nullable: true
                     type: boolean
                   resources:
@@ -11760,6 +11784,17 @@ spec:
                     description: The RFC3339 instant this slot fired (or is scheduled to); also accepts the `scheduledAt` alias.
                     nullable: true
                     type: string
+                  cron:
+                    description: |-
+                      The `spec.schedule.cron` expression this slot was computed from, as written
+                      when it was pinned. Like `timezone` and `jitter`, only ever WRITTEN on
+                      `nextSchedule`. Recorded so a cron edit invalidates the pinned slot at once
+                      instead of letting the OLD expression fire one more time. Compared with
+                      whitespace normalized, so re-spacing the expression is not a change. Absent
+                      on pins written before this field existed, which is treated as "unchanged"
+                      (the slot is recomputed with the new expression at its next natural re-pin).
+                    nullable: true
+                    type: string
                   jitter:
                     description: |-
                       The deterministic jitter window (Go-style duration, e.g. `10m`) the cron was
@@ -11810,6 +11845,17 @@ spec:
                     description: The RFC3339 instant this slot fired (or is scheduled to); also accepts the `scheduledAt` alias.
                     nullable: true
                     type: string
+                  cron:
+                    description: |-
+                      The `spec.schedule.cron` expression this slot was computed from, as written
+                      when it was pinned. Like `timezone` and `jitter`, only ever WRITTEN on
+                      `nextSchedule`. Recorded so a cron edit invalidates the pinned slot at once
+                      instead of letting the OLD expression fire one more time. Compared with
+                      whitespace normalized, so re-spacing the expression is not a change. Absent
+                      on pins written before this field existed, which is treated as "unchanged"
+                      (the slot is recomputed with the new expression at its next natural re-pin).
+                    nullable: true
+                    type: string
                   jitter:
                     description: |-
                       The deterministic jitter window (Go-style duration, e.g. `10m`) the cron was
@@ -11858,6 +11904,17 @@ spec:
                 properties:
                   at:
                     description: The RFC3339 instant this slot fired (or is scheduled to); also accepts the `scheduledAt` alias.
+                    nullable: true
+                    type: string
+                  cron:
+                    description: |-
+                      The `spec.schedule.cron` expression this slot was computed from, as written
+                      when it was pinned. Like `timezone` and `jitter`, only ever WRITTEN on
+                      `nextSchedule`. Recorded so a cron edit invalidates the pinned slot at once
+                      instead of letting the OLD expression fire one more time. Compared with
+                      whitespace normalized, so re-spacing the expression is not a change. Absent
+                      on pins written before this field existed, which is treated as "unchanged"
+                      (the slot is recomputed with the new expression at its next natural re-pin).
                     nullable: true
                     type: string
                   jitter:
@@ -12228,7 +12285,13 @@ spec:
                         type: object
                     type: object
                   privilegedMode:
-                    description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+                    description: |-
+                      Opt-in, namespace-gated privileged mode. Never changes the UID. When the mover runs
+                      as root (`runAsUser: 0`), adds the capabilities the operation needs on top of
+                      `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
+                      `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
+                      ownership). Grants nothing for maintenance, or when the mover does not run as
+                      root (capabilities are inert for non-root); set `runAsUser: 0` yourself.
                     nullable: true
                     type: boolean
                   resources:
@@ -13587,7 +13650,13 @@ spec:
                         type: object
                     type: object
                   privilegedMode:
-                    description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+                    description: |-
+                      Opt-in, namespace-gated privileged mode. Never changes the UID. When the mover runs
+                      as root (`runAsUser: 0`), adds the capabilities the operation needs on top of
+                      `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
+                      `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
+                      ownership). Grants nothing for maintenance, or when the mover does not run as
+                      root (capabilities are inert for non-root); set `runAsUser: 0` yourself.
                     nullable: true
                     type: boolean
                   resources:
@@ -14869,7 +14938,13 @@ spec:
                         type: object
                     type: object
                   privilegedMode:
-                    description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+                    description: |-
+                      Opt-in, namespace-gated privileged mode. Never changes the UID. When the mover runs
+                      as root (`runAsUser: 0`), adds the capabilities the operation needs on top of
+                      `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
+                      `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
+                      ownership). Grants nothing for maintenance, or when the mover does not run as
+                      root (capabilities are inert for non-root); set `runAsUser: 0` yourself.
                     nullable: true
                     type: boolean
                   resources:
@@ -15741,7 +15816,13 @@ spec:
                         type: object
                     type: object
                   privilegedMode:
-                    description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+                    description: |-
+                      Opt-in, namespace-gated privileged mode. Never changes the UID. When the mover runs
+                      as root (`runAsUser: 0`), adds the capabilities the operation needs on top of
+                      `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
+                      `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
+                      ownership). Grants nothing for maintenance, or when the mover does not run as
+                      root (capabilities are inert for non-root); set `runAsUser: 0` yourself.
                     nullable: true
                     type: boolean
                   resources:

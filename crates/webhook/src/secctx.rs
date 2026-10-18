@@ -57,7 +57,10 @@ fn pinned_mover_identity(mover: Option<&MoverSpec>) -> Option<secctx_compat::Mov
         None,
         None,
         None,
-    );
+    )
+    // Same `privilegedMode` grant the controller applies (#552): a privileged backup is
+    // root with DAC_OVERRIDE (reads everything); plain root is judged like any other UID.
+    .with_privileged_mode(m.privileged_mode, api::common::MoverOperation::Backup);
     let id = secctx_compat::mover_identity(
         &resolved.security_context,
         resolved.pod_security_context.as_ref(),
@@ -242,6 +245,45 @@ mod tests {
         assert!(
             id.groups.contains(&65532),
             "and it lands in the process group set too"
+        );
+    }
+
+    /// #552: admission judges the same `privilegedMode` grant the controller applies. A
+    /// privileged root reads everything (root + DAC_OVERRIDE); plain root does not, and
+    /// `privilegedMode` alone never picks a UID (it stays unpinned, so nothing to judge).
+    #[test]
+    fn the_admission_identity_applies_privileged_mode() {
+        let root = SecurityContext {
+            run_as_user: Some(0),
+            run_as_non_root: Some(false),
+            ..Default::default()
+        };
+        let privileged_root = MoverSpec {
+            security_context: Some(root.clone()),
+            privileged_mode: Some(true),
+            ..Default::default()
+        };
+        assert!(
+            pinned_mover_identity(Some(&privileged_root))
+                .expect("pinned")
+                .reads_any_file
+        );
+        let plain_root = MoverSpec {
+            security_context: Some(root),
+            ..Default::default()
+        };
+        assert!(
+            !pinned_mover_identity(Some(&plain_root))
+                .expect("pinned")
+                .reads_any_file
+        );
+        let implied = MoverSpec {
+            privileged_mode: Some(true),
+            ..Default::default()
+        };
+        assert!(
+            pinned_mover_identity(Some(&implied)).is_none(),
+            "privilegedMode alone pins no uid"
         );
     }
 

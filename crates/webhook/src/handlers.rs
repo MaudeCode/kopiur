@@ -301,6 +301,11 @@ async fn handle_snapshot_policy(
         warnings.extend(outcome.warnings);
     }
 
+    warnings.extend(
+        spec.mover
+            .as_ref()
+            .and_then(|m| m.privileged_mode_warning(api::common::MoverOperation::Backup)),
+    );
     // Best-effort, non-blocking securityContext-compatibility warning (the earliest surface).
     warnings.extend(
         crate::secctx::backup_warnings(
@@ -374,6 +379,12 @@ async fn handle_snapshot(
     // warning above), because `with_warnings` REPLACES the list rather than appending —
     // building a fresh Vec here would silently drop that warning.
     let mut warnings: Vec<String> = resp.warnings.clone().unwrap_or_default();
+    // #547: the backup Job takes this Snapshot's name.
+    if req.operation == Operation::Create
+        && let Some(name) = obj.metadata.name.as_deref()
+    {
+        warnings.extend(api::validate::job_name_length_warning("Snapshot", name));
+    }
     if req.operation == Operation::Create
         && let Some(client) = client
         && let Some(policy_ref) = spec.policy_ref.as_ref()
@@ -429,11 +440,17 @@ async fn handle_snapshot(
             // context this Snapshot has overridden. Same fail-open contract as the
             // SnapshotPolicy surface: the policy GET above already happened, so this
             // costs one Pod LIST and nothing else.
+            let effective_mover = api::snapshot::effective_backup_mover(&spec, &policy.spec);
+            warnings.extend(
+                effective_mover
+                    .as_ref()
+                    .and_then(|m| m.privileged_mode_warning(api::common::MoverOperation::Backup)),
+            );
             warnings.extend(
                 crate::secctx::backup_warnings(
                     Some(client),
                     Some(ns),
-                    api::snapshot::effective_backup_mover(&spec, &policy.spec).as_ref(),
+                    effective_mover.as_ref(),
                     assessable_sources(&spec, &policy.spec),
                 )
                 .await,
@@ -676,9 +693,15 @@ fn handle_snapshot_schedule(
     // Snapshot CRs accumulate up to the retention window and each re-reconciles for
     // its whole life, so a sub-hourly schedule with a wide retention can pile up
     // thousands of CRs. A warning, not a rejection — sub-hourly is legitimate.
-    let warnings = api::validate::schedule_cr_growth_warning(&spec.schedule.cron)
+    let mut warnings: Vec<String> = api::validate::schedule_cr_growth_warning(&spec.schedule.cron)
         .into_iter()
         .collect();
+    // #547: each run's Snapshot (and backup Job) is `<schedule>-<14 digits>`.
+    if req.operation == Operation::Create
+        && let Some(name) = obj.metadata.name.as_deref()
+    {
+        warnings.extend(api::validate::scheduled_job_name_length_warning(name));
+    }
     Ok(with_warnings(resp, warnings))
 }
 
@@ -753,13 +776,27 @@ async fn handle_restore(
             None
         }
     };
-    let warnings = crate::secctx::restore_warnings(
-        client,
-        req.namespace.as_deref(),
-        spec.mover.as_ref(),
-        target_pvc,
-    )
-    .await;
+    let mut warnings: Vec<String> = spec
+        .mover
+        .as_ref()
+        .and_then(|m| m.privileged_mode_warning(api::common::MoverOperation::Restore))
+        .into_iter()
+        .collect();
+    warnings.extend(
+        crate::secctx::restore_warnings(
+            client,
+            req.namespace.as_deref(),
+            spec.mover.as_ref(),
+            target_pvc,
+        )
+        .await,
+    );
+    // #547: the restore Job takes this Restore's name.
+    if req.operation == Operation::Create
+        && let Some(name) = obj.metadata.name.as_deref()
+    {
+        warnings.extend(api::validate::job_name_length_warning("Restore", name));
+    }
     Ok(with_warnings(resp, warnings))
 }
 
@@ -3117,6 +3154,74 @@ mod tests {
         });
         let resp = dispatch(&admission_request("SnapshotSchedule", spec), None).await;
         assert!(resp.allowed, "{:?}", resp.result.message);
+    }
+
+    // --- #547: Job-name length warnings (WorkloadWithJob `<job>-pgt-0`) -----
+
+    /// [`admission_request`] with `metadata.name` set to `name`.
+    fn named_create_request(
+        kind: &str,
+        name: &str,
+        spec: Value,
+    ) -> AdmissionRequest<DynamicObject> {
+        let mut req = admission_request(kind, spec);
+        if let Some(obj) = req.object.as_mut() {
+            obj.metadata.name = Some(name.to_string());
+        }
+        req
+    }
+
+    fn long_name_warnings(resp: &AdmissionResponse) -> Vec<String> {
+        resp.warnings
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|w| w.contains("WorkloadWithJob"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_long_snapshot_or_restore_name_is_admitted_with_a_job_name_warning() {
+        let long = "n".repeat(58);
+        let snapshot = json!({ "policyRef": { "name": "nightly" } });
+        let restore = from_policy_restore(None);
+        for (kind, spec) in [("Snapshot", snapshot), ("Restore", restore)] {
+            let resp = dispatch(&named_create_request(kind, &long, spec.clone()), None).await;
+            assert!(resp.allowed, "{kind}: {:?}", resp.result.message);
+            let w = long_name_warnings(&resp);
+            assert_eq!(w.len(), 1, "{kind}: {:?}", resp.warnings);
+            assert!(w[0].starts_with(kind), "{w:?}");
+
+            let short = dispatch(&named_create_request(kind, "db-1", spec), None).await;
+            assert!(short.allowed);
+            assert!(
+                long_name_warnings(&short).is_empty(),
+                "{:?}",
+                short.warnings
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_schedule_name_warns_about_its_runs_job_names() {
+        let spec = json!({
+            "policyRef": { "name": "pg" },
+            "schedule": { "cron": "0 2 * * *" },
+        });
+        let resp = dispatch(
+            &named_create_request("SnapshotSchedule", &"s".repeat(43), spec.clone()),
+            None,
+        )
+        .await;
+        assert!(resp.allowed, "{:?}", resp.result.message);
+        assert_eq!(long_name_warnings(&resp).len(), 1, "{:?}", resp.warnings);
+
+        let fits = dispatch(
+            &named_create_request("SnapshotSchedule", &"s".repeat(42), spec),
+            None,
+        )
+        .await;
+        assert!(long_name_warnings(&fits).is_empty(), "{:?}", fits.warnings);
     }
 
     #[tokio::test]

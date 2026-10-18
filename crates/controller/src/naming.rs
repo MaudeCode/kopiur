@@ -24,6 +24,42 @@ pub fn capped_name(full: &str) -> String {
     format!("{}-{:016x}", prefix.trim_end_matches('-'), fnv1a(full))
 }
 
+/// Cap a generated **Job** name at [`kopiur_api::consts::JOB_NAME_MAX`] (57) so the
+/// `<job>-pgt-0` pod-group template Kubernetes 1.37's `WorkloadWithJob` derives
+/// from it is still a valid 63-character name (#547). Short names pass through
+/// unchanged; longer ones keep their leading 40 characters plus a stable FNV-1a
+/// hash of the full name (16 hex), so they stay unique and deterministic.
+///
+/// A separate helper on purpose: [`capped_name`] (63) also names Secrets and
+/// adopted `Snapshot` CRs, and changing it would rename live objects. A caller
+/// switching a Job from `capped_name` to this must keep finding an in-flight Job
+/// under its old name (see [`legacy_job_name`]) unless the name is never a lookup
+/// key.
+pub fn capped_job_name(full: &str) -> String {
+    use kopiur_api::consts::JOB_NAME_MAX;
+    if full.len() <= JOB_NAME_MAX {
+        return full.to_string();
+    }
+    // 16 hex + the joining dash.
+    let keep = JOB_NAME_MAX - 17;
+    let prefix: String = full.chars().take(keep).collect();
+    format!(
+        "{}-{:016x}",
+        prefix.trim_end_matches(['-', '.']),
+        fnv1a(full)
+    )
+}
+
+/// The name a Job that is looked up by name had under the previous scheme, when
+/// it differs from the `current` one: `Some(legacy)` means "check for an
+/// in-flight Job called `legacy` before creating `current`" (#547 upgrade path).
+/// `None` when the two agree (every name ≤ 57 characters), so the common case
+/// costs no extra GET. A legacy name over 63 characters could never have been
+/// created (Kubernetes rejects it), so it is not worth a lookup either.
+pub fn legacy_job_name(legacy: &str, current: &str) -> Option<String> {
+    (legacy != current && legacy.len() <= 63).then(|| legacy.to_string())
+}
+
 /// A short, stable (run-independent) 8-hex-char FNV-1a hash for name truncation.
 pub fn short_hash(s: &str) -> String {
     format!("{:08x}", (fnv1a(s) & 0xffff_ffff))
@@ -100,6 +136,20 @@ pub fn repo_label(r: &RepositoryRef) -> String {
     format!("{short}-{hash}")
 }
 
+/// The dedicated persistent kopia-cache PVC for ONE repository's batch
+/// snapshot-delete (`snapdel-*`) Jobs (#582): `kopiur-cache-snapdel-<repo_label>`.
+///
+/// Keyed by [`repo_label`] (so a namespaced `Repository` and a `ClusterRepository`
+/// of the same name, or two same-named repositories in different namespaces, never
+/// share a cache) and capped by [`capped_name`]. `repo_label` keeps up to 40 chars
+/// of the repository name, which may contain `.`; that is mapped to `-` so the
+/// result is a single DNS-1123 label (a `.-` sequence would be an invalid
+/// subdomain). Needs a NORMALIZED ref, like `repo_label`.
+pub fn snapdel_cache_pvc_name(r: &RepositoryRef) -> String {
+    let label = repo_label(r).replace('.', "-").to_ascii_lowercase();
+    capped_name(&format!("kopiur-cache-snapdel-{label}"))
+}
+
 /// 64-bit FNV-1a over the string's bytes.
 fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -138,6 +188,124 @@ mod tests {
         // upgrade. Pin a literal.
         let long_a = format!("{}-snap-a-delete", "n".repeat(80));
         assert!(capped_name(&long_a).ends_with("-78b92bff1e6d5c26"));
+    }
+
+    // --- capped_job_name / legacy_job_name (#547) ---------------------------
+
+    /// A DNS-1123 subdomain whose every label is a valid DNS label (what a Job
+    /// name must be).
+    fn is_dns1123_subdomain(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= 253
+            && s.split('.').all(|l| {
+                !l.is_empty()
+                    && l.chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    && !l.starts_with('-')
+                    && !l.ends_with('-')
+            })
+    }
+
+    #[test]
+    fn capped_job_name_passes_names_within_the_budget_through() {
+        for n in ["nas-discovery", "db-1-pin", &"a".repeat(57)] {
+            assert_eq!(capped_job_name(n), n);
+        }
+    }
+
+    #[test]
+    fn capped_job_name_leaves_room_for_the_pod_group_template_suffix() {
+        for len in [58, 63, 64, 100, 300] {
+            let full = format!("{}-pin", "s".repeat(len));
+            let n = capped_job_name(&full);
+            assert!(n.len() <= kopiur_api::consts::JOB_NAME_MAX, "{n}");
+            assert!(n.len() + "-pgt-0".len() <= 63, "{n}");
+            assert!(is_dns1123_subdomain(&n), "{n}");
+            assert_eq!(n, capped_job_name(&full), "deterministic");
+        }
+        // Distinct inputs that share the kept prefix stay distinct.
+        let a = capped_job_name(&format!("{}-a", "x".repeat(70)));
+        let b = capped_job_name(&format!("{}-b", "x".repeat(70)));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn capped_job_name_never_leaves_a_dot_dash_seam() {
+        // A dotted CR name clipped right after a '.' must not yield `.-<hash>`.
+        let full = format!("{}.{}", "a".repeat(39), "b".repeat(40));
+        let n = capped_job_name(&full);
+        assert!(is_dns1123_subdomain(&n), "{n}");
+    }
+
+    #[test]
+    fn capped_job_name_hash_is_pinned_across_toolchains() {
+        // It names on-cluster Jobs that are looked up by name: pin a literal.
+        let n = capped_job_name(&format!("{}-pin", "n".repeat(80)));
+        assert_eq!(n, format!("{}-a3acdf9e0ac9ea17", "n".repeat(40)));
+    }
+
+    #[test]
+    fn legacy_job_name_only_when_the_schemes_disagree() {
+        assert_eq!(legacy_job_name("nas-discovery", "nas-discovery"), None);
+        let legacy = format!("{}-discovery", "r".repeat(50)); // 60 chars: was valid
+        let current = capped_job_name(&legacy);
+        assert_eq!(legacy_job_name(&legacy, &current), Some(legacy.clone()));
+        // A >63 legacy name could never have been created: no lookup.
+        let impossible = format!("{}-pin", "s".repeat(70));
+        assert_eq!(
+            legacy_job_name(&impossible, &capped_job_name(&impossible)),
+            None
+        );
+    }
+
+    // --- snapdel_cache_pvc_name (#582) --------------------------------------
+
+    fn rref(kind: RepositoryKind, ns: Option<&str>, name: &str) -> RepositoryRef {
+        RepositoryRef {
+            kind,
+            name: name.into(),
+            namespace: ns.map(str::to_string),
+        }
+    }
+
+    fn is_dns1123_label(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= 63
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !s.starts_with('-')
+            && !s.ends_with('-')
+    }
+
+    #[test]
+    fn snapdel_cache_pvc_name_is_per_repository_and_dns_safe() {
+        let garage = rref(RepositoryKind::ClusterRepository, None, "garage");
+        let n = snapdel_cache_pvc_name(&garage);
+        assert_eq!(n, format!("kopiur-cache-snapdel-{}", repo_label(&garage)));
+        assert!(is_dns1123_label(&n), "{n}");
+        assert_eq!(n, snapdel_cache_pvc_name(&garage), "deterministic");
+        // Never the Maintenance PVC (`kopiur-cache-<maintenance>`) for the same repo.
+        assert_ne!(n, "kopiur-cache-garage");
+        // A namespaced Repository of the same name gets its own cache.
+        assert_ne!(
+            n,
+            snapdel_cache_pvc_name(&rref(RepositoryKind::Repository, Some("b"), "garage"))
+        );
+        assert_ne!(
+            snapdel_cache_pvc_name(&rref(RepositoryKind::Repository, Some("a"), "garage")),
+            snapdel_cache_pvc_name(&rref(RepositoryKind::Repository, Some("b"), "garage"))
+        );
+    }
+
+    #[test]
+    fn snapdel_cache_pvc_name_bounds_long_and_dotted_repository_names() {
+        let dotted = rref(
+            RepositoryKind::ClusterRepository,
+            None,
+            "s3.eu-central-1.backups.example.com.very-long-bucket-name-here",
+        );
+        let n = snapdel_cache_pvc_name(&dotted);
+        assert!(is_dns1123_label(&n), "{n} ({} chars)", n.len());
     }
 
     // --- short_hash -----------------------------------------------------------
@@ -203,11 +371,24 @@ mod tests {
 /// reconciler would launch a second mover against the same repository, or leave
 /// a 24h seeding Job running after its CR is gone.
 ///
+/// Capped to [`kopiur_api::consts::JOB_NAME_MAX`] (#547), so a repository name
+/// of 48+ characters gets a hashed name. The pre-#547 uncapped name of an
+/// in-flight Job is [`legacy_discovery_job_name`]; callers resolve which one is
+/// live with `io::discovery_job_name_in_use` so an upgrade mid-run never launches
+/// a second mover against the repository.
+///
 /// ```
 /// assert_eq!(kopiur_controller::naming::discovery_job_name("nas"), "nas-discovery");
 /// ```
 pub fn discovery_job_name(repo: &str) -> String {
-    format!("{repo}-discovery")
+    capped_job_name(&format!("{repo}-discovery"))
+}
+
+/// The pre-#547 uncapped discovery Job name, when it differs from
+/// [`discovery_job_name`] and could have been created (≤ 63 characters):
+/// `Some` only for repository names of 48 to 53 characters.
+pub fn legacy_discovery_job_name(repo: &str) -> Option<String> {
+    legacy_job_name(&format!("{repo}-discovery"), &discovery_job_name(repo))
 }
 
 #[cfg(test)]
@@ -216,5 +397,27 @@ mod discovery_job_name_tests {
     fn the_suffix_is_the_one_every_lookup_site_uses() {
         assert_eq!(super::discovery_job_name("nas"), "nas-discovery");
         assert_eq!(super::discovery_job_name("shared"), "shared-discovery");
+        assert_eq!(super::legacy_discovery_job_name("nas"), None);
+    }
+
+    #[test]
+    fn a_long_repository_name_fits_the_pod_group_template_budget() {
+        // 50 chars: `<repo>-discovery` was 60 (valid, but `-pgt-0` made 66).
+        let repo = "r".repeat(50);
+        let current = super::discovery_job_name(&repo);
+        assert!(current.len() + "-pgt-0".len() <= 63, "{current}");
+        assert_eq!(
+            super::legacy_discovery_job_name(&repo),
+            Some(format!("{repo}-discovery"))
+        );
+        // 47 chars is exactly 57: unchanged, no legacy lookup.
+        let fits = "r".repeat(47);
+        assert_eq!(
+            super::discovery_job_name(&fits),
+            format!("{fits}-discovery")
+        );
+        assert_eq!(super::legacy_discovery_job_name(&fits), None);
+        // 60 chars: the old name (70) could never have been created.
+        assert_eq!(super::legacy_discovery_job_name(&"r".repeat(60)), None);
     }
 }

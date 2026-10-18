@@ -3176,6 +3176,7 @@ async fn run_restore_mover(
         if outgoing {
             return Ok(MoverOutcome::Running { created: false });
         }
+        io::clear_stale_mover_permitted_in_flight(api, restore).await;
         return observe_restore_mover(ctx, restore, namespace, job_name, &job).await;
     }
 
@@ -3445,6 +3446,20 @@ async fn run_restore_mover(
             .as_ref()
             .and_then(|m| m.ttl_seconds_after_finished),
     );
+    // `privilegedMode` grants a ROOT restore (`runAsUser: 0`, set by the user — it never
+    // changes the UID) CHOWN/DAC_OVERRIDE/FOWNER/FSETID so it can write anywhere in the
+    // target and reproduce each file's recorded owner and mode (#552). For any other UID it
+    // is inert and warns. Applied before the gate so the gate and the Job see the same
+    // context.
+    // Re-published on every pre-launch pass by design: the kube-runtime Recorder folds an
+    // identical Event (same reason/note/regarding, within its TTL) into ONE object with a
+    // climbing `series.count` (`io::event_ref` strips the churning resourceVersion so the
+    // key matches), so this never mints a new Event per pass.
+    let (resolved_mover, privileged_effect) = resolved_mover
+        .with_privileged_mode_effect(privileged_mode, kopiur_api::common::MoverOperation::Restore);
+    if let Some(msg) = privileged_effect.warning() {
+        io::publish_warning_event(ctx, restore, "PrivilegedModeInert", "Reconcile", &msg).await;
+    }
 
     // Privileged-mover gate (ADR §4.11/§G16, VolSync-parity): an elevated restore mover
     // (root/privileged/added caps/`privilegedMode`, container- OR pod-level) requires the
@@ -3525,10 +3540,13 @@ async fn run_restore_mover(
     }
     // Permitted: clear any stale `MoverPermitted=False` from a prior reconcile.
     // Live-based (see `io::clear_work_condition_if_stale`) — the #464 heal ran
-    // above and this patch replaces the array it wrote.
+    // above and this patch replaces the array it wrote. `StaleCheck::Live`: the
+    // start-of-pass store copy may predate our own `MoverPermitted=False` echo, and
+    // a clear skipped here is never revisited once the Job exists (#194).
     io::clear_work_condition_if_stale(
         api,
         restore,
+        io::StaleCheck::Live,
         MOVER_PERMITTED_CONDITION,
         "Permitted",
         "the mover is permitted in this namespace",
@@ -3654,8 +3672,16 @@ async fn run_restore_mover(
             "credentials Secret(s) present in the mover namespace",
         )
     };
-    io::clear_work_condition_if_stale(api, restore, CREDENTIALS_AVAILABLE_CONDITION, reason, note)
-        .await?;
+    // Live for the same #194 reason as the MoverPermitted clear above.
+    io::clear_work_condition_if_stale(
+        api,
+        restore,
+        io::StaleCheck::Live,
+        CREDENTIALS_AVAILABLE_CONDITION,
+        reason,
+        note,
+    )
+    .await?;
     let creds_secrets = io::plain_creds(creds.names);
 
     let identity = MoverIdentity {
@@ -3805,6 +3831,7 @@ async fn run_restore_mover(
         work_spec: &work_spec,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
+        image_pull_secrets: &ctx.mover_image_pull_secrets,
         limits: {
             let mut l = restore_job_limits(restore);
             if l.ttl_seconds_after_finished.is_none() {
